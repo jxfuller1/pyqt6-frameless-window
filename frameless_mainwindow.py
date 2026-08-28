@@ -48,6 +48,11 @@ if IS_WINDOWS:
     MONITOR_DEFAULTTONEAREST = 2
     TPM_RETURNCMD = 0x0100
     TPM_RIGHTBUTTON = 0x0002
+    SWP_NOSIZE = 0x0001
+    SWP_NOMOVE = 0x0002
+    SWP_NOZORDER = 0x0004
+    SWP_NOACTIVATE = 0x0010
+    SWP_FRAMECHANGED = 0x0020
 
     DWMWA_USE_IMMERSIVE_DARK_MODE = 20
     DWMWA_WINDOW_CORNER_PREFERENCE = 33
@@ -55,6 +60,7 @@ if IS_WINDOWS:
     DWMWCP_DEFAULT = 0
     DWMWCP_ROUND = 2
     DWMSBT_AUTO = 0
+    DWMSBT_NONE = 1
     DWMSBT_MAINWINDOW = 2       # Mica
     DWMSBT_TRANSIENTWINDOW = 3 # Acrylic-like transient backdrop on supported Win11 builds
     DWMSBT_TABBEDWINDOW = 4    # Mica Alt
@@ -97,6 +103,27 @@ if IS_WINDOWS:
                                       ctypes.c_int, wintypes.HWND, ctypes.c_void_p)
     user32.PostMessageW.restype = wintypes.BOOL
     user32.PostMessageW.argtypes = (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+    user32.SetWindowPos.restype = wintypes.BOOL
+    user32.SetWindowPos.argtypes = (
+        wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, wintypes.UINT,
+    )
+    get_dpi_for_window = getattr(user32, "GetDpiForWindow", None)
+    if get_dpi_for_window is not None:
+        get_dpi_for_window.restype = wintypes.UINT
+        get_dpi_for_window.argtypes = (wintypes.HWND,)
+
+    # ctypes otherwise assumes 32-bit integer arguments, which is unsafe for
+    # HWND/WPARAM/LPARAM on 64-bit Python.
+    dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long  # HRESULT
+    dwmapi.DwmSetWindowAttribute.argtypes = (
+        wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+    )
+    dwmapi.DwmDefWindowProc.restype = wintypes.BOOL
+    dwmapi.DwmDefWindowProc.argtypes = (
+        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+        ctypes.POINTER(ctypes.c_ssize_t),
+    )
 
 
 def _signed_word(value: int) -> int:
@@ -161,6 +188,7 @@ class CaptionButton(QPushButton):
         super().__init__(parent)
         self.kind = kind
         self.active = True
+        self.dark_mode = True
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setCursor(Qt.CursorShape.ArrowCursor)
         self.setFixedWidth(46)
@@ -172,6 +200,11 @@ class CaptionButton(QPushButton):
         self._apply_style()
         self.update()
 
+    def setDarkMode(self, enabled: bool) -> None:
+        self.dark_mode = bool(enabled)
+        self._apply_style()
+        self.update()
+
     def _apply_style(self) -> None:
         if self.kind == "close":
             self.setStyleSheet(
@@ -180,17 +213,22 @@ class CaptionButton(QPushButton):
                 "QPushButton:pressed{background:rgb(150,32,22);}"
             )
         else:
+            hover = "rgba(255,255,255,28)" if self.dark_mode else "rgba(0,0,0,20)"
+            pressed = "rgba(255,255,255,42)" if self.dark_mode else "rgba(0,0,0,32)"
             self.setStyleSheet(
                 "QPushButton{border:0;background:transparent;}"
-                "QPushButton:hover{background:rgba(255,255,255,28);}"
-                "QPushButton:pressed{background:rgba(255,255,255,42);}"
+                f"QPushButton:hover{{background:{hover};}}"
+                f"QPushButton:pressed{{background:{pressed};}}"
             )
 
     def paintEvent(self, event):
         super().paintEvent(event)
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        c = QColor(235, 235, 235) if self.active else QColor(155, 155, 155)
+        if self.dark_mode:
+            c = QColor(235, 235, 235) if self.active else QColor(155, 155, 155)
+        else:
+            c = QColor(30, 30, 30) if self.active else QColor(130, 130, 130)
         p.setPen(QPen(c, 1.0))
         cx, cy = self.width() // 2, self.height() // 2
         if self.kind == "min":
@@ -210,8 +248,13 @@ class CustomTitleBar(QWidget):
 
     def __init__(self, window: "FramelessMainWindow"):
         super().__init__(window)
-        self.window = window
+        # Keep QWidget.window() intact: the native hit-test code relies on it to
+        # map child geometry to the top-level window. Shadowing it with an
+        # instance attribute causes a TypeError as soon as the cursor reaches
+        # the title bar.
+        self._host_window = window
         self.active = True
+        self.dark_mode = True
         self.setObjectName("customTitleBar")
         self.setFixedHeight(self.HEIGHT)
 
@@ -221,7 +264,7 @@ class CustomTitleBar(QWidget):
 
         self.title = QLabel(window.windowTitle(), self)
         self.title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.title.setStyleSheet("color:rgb(235,235,235);")
+        self._apply_title_color()
 
         # Windows uses custom caption buttons. macOS intentionally keeps the
         # genuine AppKit traffic lights because they preserve native full-screen,
@@ -238,21 +281,32 @@ class CustomTitleBar(QWidget):
         self.refreshIcon()
 
     def refreshIcon(self) -> None:
-        icon = self.window.windowIcon()
+        icon = self._host_window.windowIcon()
         if icon.isNull() and QApplication.instance():
             icon = QApplication.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
         self.icon.setPixmap(icon.pixmap(16, 16))
 
     def setActive(self, active: bool) -> None:
         self.active = active
-        self.title.setStyleSheet(
-            f"color:rgb({235 if active else 150},{235 if active else 150},{235 if active else 150});"
-        )
+        self._apply_title_color()
         for b in (self.min_button, self.max_button, self.close_button):
             b.setActive(active)
         self.setProperty("activeWindow", active)
         self.style().unpolish(self)
         self.style().polish(self)
+
+    def setDarkMode(self, enabled: bool) -> None:
+        self.dark_mode = bool(enabled)
+        self._apply_title_color()
+        for b in (self.min_button, self.max_button, self.close_button):
+            b.setDarkMode(enabled)
+
+    def _apply_title_color(self) -> None:
+        if self.dark_mode:
+            color = 235 if self.active else 150
+        else:
+            color = 30 if self.active else 130
+        self.title.setStyleSheet(f"color:rgb({color},{color},{color});")
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -274,11 +328,11 @@ class CustomTitleBar(QWidget):
         self.title.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
 
     def mousePressEvent(self, event: QMouseEvent):
-        # On Windows native WM_NCHITTEST turns this area into HTCAPTION. On macOS
-        # the custom Qt widget lives in AppKit's title area, so explicitly start
-        # the OS-managed drag to retain native window movement/tiling behavior.
-        if IS_MACOS and event.button() == Qt.MouseButton.LeftButton:
-            handle = self.window.windowHandle()
+        # Windows native WM_NCHITTEST turns this area into HTCAPTION. The other
+        # platforms use Qt's system move operation so the compositor can retain
+        # native dragging, snapping, and tiling behavior where it supports it.
+        if not IS_WINDOWS and event.button() == Qt.MouseButton.LeftButton:
+            handle = self._host_window.windowHandle()
             if handle and handle.startSystemMove():
                 event.accept()
                 return
@@ -286,7 +340,7 @@ class CustomTitleBar(QWidget):
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton and not self._over_caption_button(event.position().toPoint()):
-            self.window.toggleMaximized()
+            self._host_window.toggleMaximized()
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
@@ -401,7 +455,9 @@ class FramelessMainWindow(QMainWindow):
         opaquely. This method configures the native backdrop; applications can
         choose their own translucent/transparent content treatment.
         """
-        self._backdrop_type = DWMSBT_MAINWINDOW if (IS_WINDOWS and enabled) else 0
+        self._backdrop_type = (
+            (DWMSBT_MAINWINDOW if enabled else DWMSBT_NONE) if IS_WINDOWS else 0
+        )
         if IS_WINDOWS:
             self._apply_windows_dwm_options()
 
@@ -411,7 +467,7 @@ class FramelessMainWindow(QMainWindow):
             return
         modes = {
             "auto": DWMSBT_AUTO,
-            "none": DWMSBT_AUTO,
+            "none": DWMSBT_NONE,
             "mica": DWMSBT_MAINWINDOW,
             "acrylic": DWMSBT_TRANSIENTWINDOW,
             "mica_alt": DWMSBT_TABBEDWINDOW,
@@ -451,6 +507,8 @@ class FramelessMainWindow(QMainWindow):
                 "#customTitleBar[activeWindow=\"false\"]{background:rgb(238,238,238);}"
                 "QLabel{color:rgb(30,30,30);}"
             )
+        if hasattr(self, "title_bar"):
+            self.title_bar.setDarkMode(self._dark_mode)
 
     def changeEvent(self, event):
         super().changeEvent(event)
@@ -479,10 +537,17 @@ class FramelessMainWindow(QMainWindow):
             style = user32.GetWindowLongPtrW(hwnd, GWL_STYLE)
             style |= WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU
             user32.SetWindowLongPtrW(hwnd, GWL_STYLE, style)
+            # Tell Windows to re-read the modified non-client style immediately.
+            # Without SWP_FRAMECHANGED, the added system-menu and resize styles
+            # can remain stale until a later unrelated geometry change.
+            user32.SetWindowPos(
+                wintypes.HWND(hwnd), None, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            )
             self._apply_windows_dwm_options()
 
-        def _apply_windows_dwm_options(self) -> None:
-            hwnd = wintypes.HWND(self._hwnd())
+        def _apply_windows_dwm_options(self, hwnd_value: int | None = None) -> None:
+            hwnd = wintypes.HWND(hwnd_value if hwnd_value is not None else self._hwnd())
             corner = ctypes.c_int(DWMWCP_ROUND)
             dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
                                          ctypes.byref(corner), ctypes.sizeof(corner))
@@ -490,17 +555,16 @@ class FramelessMainWindow(QMainWindow):
             dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
                                          ctypes.byref(dark), ctypes.sizeof(dark))
             backdrop = ctypes.c_int(self._backdrop_type)
-            # Attribute 38 is supported on modern Windows 11. Failure on an older
-            # build is harmless and simply leaves the normal DWM backdrop.
-            try:
-                dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE,
-                                             ctypes.byref(backdrop), ctypes.sizeof(backdrop))
-            except Exception:
-                pass
+            # Attribute 38 is supported on modern Windows 11. An unsupported
+            # build reports an HRESULT; it does not raise a Python exception.
+            # Ignoring that result deliberately leaves the normal DWM backdrop.
+            dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE,
+                                         ctypes.byref(backdrop), ctypes.sizeof(backdrop))
 
-        def _screen_to_client_native(self, x: int, y: int) -> tuple[int, int]:
+        @staticmethod
+        def _screen_to_client_native(hwnd: int, x: int, y: int) -> tuple[int, int]:
             pt = POINT(x, y)
-            user32.ScreenToClient(wintypes.HWND(self._hwnd()), ctypes.byref(pt))
+            user32.ScreenToClient(wintypes.HWND(hwnd), ctypes.byref(pt))
             return int(pt.x), int(pt.y)
 
         @staticmethod
@@ -510,8 +574,14 @@ class FramelessMainWindow(QMainWindow):
                     round((top_left.x() + widget.width()) * dpr),
                     round((top_left.y() + widget.height()) * dpr))
 
-        def _window_dpr(self) -> float:
-            # devicePixelRatioF follows the QWindow as it moves between monitors.
+        def _window_dpr(self, hwnd: int | None = None) -> float:
+            # The hit test arrives in physical pixels. GetDpiForWindow tracks the
+            # target monitor during a per-monitor DPI transition more directly
+            # than QWindow's cached DPR; Qt remains the fallback for older Windows.
+            if get_dpi_for_window is not None:
+                dpi = get_dpi_for_window(wintypes.HWND(hwnd if hwnd is not None else self._hwnd()))
+                if dpi:
+                    return dpi / 96.0
             handle = self.windowHandle()
             return handle.devicePixelRatio() if handle else self.devicePixelRatioF()
 
@@ -564,13 +634,14 @@ class FramelessMainWindow(QMainWindow):
             mmi.ptMaxPosition.y = work.top - mon.top
             mmi.ptMaxSize.x = work.right - work.left
             mmi.ptMaxSize.y = work.bottom - work.top
-            dpr = self._window_dpr()
+            dpr = self._window_dpr(int(msg.hwnd))
             minimum = self.minimumSize()
             mmi.ptMinTrackSize.x = max(mmi.ptMinTrackSize.x, round(minimum.width() * dpr))
             mmi.ptMinTrackSize.y = max(mmi.ptMinTrackSize.y, round(minimum.height() * dpr))
 
-        def _show_system_menu(self, screen_x: int, screen_y: int) -> None:
-            hwnd = wintypes.HWND(self._hwnd())
+        @staticmethod
+        def _show_system_menu(hwnd_value: int, screen_x: int, screen_y: int) -> None:
+            hwnd = wintypes.HWND(hwnd_value)
             menu = user32.GetSystemMenu(hwnd, False)
             if not menu:
                 return
@@ -590,10 +661,19 @@ class FramelessMainWindow(QMainWindow):
                 return True, 0
 
             if msg.message == WM_NCHITTEST:
+                # DWM gets the first opportunity to identify any non-client
+                # regions it owns. This is required for custom frames on Vista+
+                # and keeps future DWM behavior from being shadowed by our hit
+                # testing.
+                dwm_result = ctypes.c_ssize_t()
+                if dwmapi.DwmDefWindowProc(
+                    msg.hwnd, msg.message, msg.wParam, msg.lParam, ctypes.byref(dwm_result)
+                ):
+                    return True, int(dwm_result.value)
                 screen_x = _signed_word(int(msg.lParam))
                 screen_y = _signed_word(int(msg.lParam) >> 16)
-                x, y = self._screen_to_client_native(screen_x, screen_y)
-                dpr = self._window_dpr()
+                x, y = self._screen_to_client_native(int(msg.hwnd), screen_x, screen_y)
+                dpr = self._window_dpr(int(msg.hwnd))
                 resize = self._resize_hit_test(x, y, dpr)
                 if resize is not None:
                     return True, resize
@@ -605,15 +685,19 @@ class FramelessMainWindow(QMainWindow):
             if msg.message == WM_NCRBUTTONUP and int(msg.wParam) in (HTCAPTION, HTSYSMENU):
                 screen_x = _signed_word(int(msg.lParam))
                 screen_y = _signed_word(int(msg.lParam) >> 16)
-                self._show_system_menu(screen_x, screen_y)
+                self._show_system_menu(int(msg.hwnd), screen_x, screen_y)
                 return True, 0
 
             if msg.message == WM_DPICHANGED:
                 # Qt applies the suggested geometry itself. Re-apply DWM options
                 # after the transition; hit tests always query the current DPR.
-                self._apply_windows_dwm_options()
+                self._apply_windows_dwm_options(int(msg.hwnd))
 
-            return super().nativeEvent(eventType, message)
+            # Do *not* call QMainWindow.nativeEvent() here. In PyQt6 that can
+            # recurse through the Python override while the HWND is being created
+            # and terminate the process with an access violation. Returning False
+            # is Qt's documented way to let it dispatch an unhandled native event.
+            return False, 0
 
 
 if __name__ == "__main__":
