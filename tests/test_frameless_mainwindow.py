@@ -190,7 +190,10 @@ class FramelessMainWindowTests(unittest.TestCase):
 
     @unittest.skipUnless(IS_WINDOWS, "Windows-only taskbar restore behavior")
     def test_windows_maximize_click_restores_after_taskbar_restore(self) -> None:
-        normal_geometry = self.window.geometry()
+        # Qt 6.11 on Windows Server exposes WS_THICKFRAME in geometry() after
+        # a maximize cycle, so frameGeometry() is the stable, visible window
+        # bounds that this behavior must preserve.
+        normal_geometry = self.window.frameGeometry()
         hwnd = self.window._hwnd()
         self.window.showMaximized()
         self.app.processEvents()
@@ -241,7 +244,7 @@ class FramelessMainWindowTests(unittest.TestCase):
         )
         self.app.processEvents()
         self.assertFalse(self.window._is_chrome_maximized())
-        self.assertEqual(self.window.geometry(), normal_geometry)
+        self.assertEqual(self.window.frameGeometry(), normal_geometry)
 
         dpr = self.window._window_dpr(hwnd)
         native_mid_y = round(self.window.height() * dpr / 2)
@@ -249,7 +252,7 @@ class FramelessMainWindowTests(unittest.TestCase):
 
     @unittest.skipUnless(IS_WINDOWS, "Windows-only drag from maximized title bar")
     def test_windows_dragging_maximized_title_bar_restores_and_enables_resize(self) -> None:
-        normal_geometry = self.window.geometry()
+        normal_geometry = self.window.frameGeometry()
         self.window.showMaximized()
         self.app.processEvents()
 
@@ -281,7 +284,7 @@ class FramelessMainWindowTests(unittest.TestCase):
         self.app.processEvents()
 
         self.assertFalse(self.window._is_chrome_maximized())
-        self.assertEqual(self.window.size(), normal_geometry.size())
+        self.assertEqual(self.window.frameGeometry().size(), normal_geometry.size())
         self.assertTrue(title_bar._system_move_started)
         dpr = self.window._window_dpr(self.window._hwnd())
         native_mid_y = round(self.window.height() * dpr / 2)
