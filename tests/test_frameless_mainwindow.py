@@ -6,6 +6,7 @@ import ctypes
 import os
 import sys
 import unittest
+from unittest import mock
 
 # This needs to run before PyQt6 is imported on CI Linux runners. Windows uses
 # the real QPA backend so the native-handle creation path is covered there.
@@ -15,6 +16,7 @@ if sys.platform != "win32":
 from PyQt6 import sip
 from PyQt6.QtCore import QEvent, QPoint, QPointF, Qt
 from PyQt6.QtGui import QMouseEvent
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QWidget
 
 import frameless_mainwindow as fw
@@ -83,6 +85,14 @@ class FramelessMainWindowTests(unittest.TestCase):
             self.window._caption_hit_test((left + right) // 2, (top + bottom) // 2, dpr),
             fw.HTCLIENT,
         )
+
+    @unittest.skipUnless(IS_WINDOWS, "Windows-only DWM fallback")
+    def test_windows_dwm_options_tolerate_unavailable_attribute_api(self) -> None:
+        """Unsupported DWM attributes must not prevent window operation."""
+        with mock.patch.object(
+            fw.dwmapi, "DwmSetWindowAttribute", side_effect=OSError("unsupported")
+        ):
+            self.window._apply_windows_dwm_options()
 
     @unittest.skipUnless(IS_WINDOWS, "Windows-only custom caption controls")
     def test_windows_caption_styles_do_not_draw_native_buttons(self) -> None:
@@ -378,6 +388,60 @@ class FramelessMainWindowTests(unittest.TestCase):
         self.window.showMaximized()
         self.app.processEvents()
         self.assertEqual(self.window.geometry(), self.window.screen().availableGeometry())
+
+    @unittest.skipUnless(IS_WINDOWS, "Windows-only auto-hide taskbar behavior")
+    def test_windows_auto_hide_taskbar_inset_is_per_edge_and_physical(self) -> None:
+        # The Win32 maximization message and app-bar rectangles are physical
+        # pixels; verify each edge reserves only the native reveal strip and
+        # does not mutate the OS-provided work-area rectangle.
+        source = fw.RECT(-1920, 10, 0, 1090)
+        monitor = fw.RECT(-1920, 0, 0, 1080)
+        expected = {
+            fw.ABE_LEFT: (-1918, 10, 0, 1090),
+            fw.ABE_TOP: (-1920, 12, 0, 1090),
+            fw.ABE_RIGHT: (-1920, 10, -2, 1090),
+            fw.ABE_BOTTOM: (-1920, 10, 0, 1088),
+        }
+        for edge, bounds in expected.items():
+            with self.subTest(edge=edge), mock.patch.object(
+                FramelessMainWindow, "_auto_hide_taskbar_edge", return_value=edge
+            ):
+                result = self.window._work_area_with_auto_hide_taskbar_inset(source, monitor)
+                self.assertEqual(
+                    (result.left, result.top, result.right, result.bottom), bounds
+                )
+        self.assertEqual((source.left, source.top, source.right, source.bottom), (-1920, 10, 0, 1090))
+
+    @unittest.skipUnless(IS_WINDOWS, "Windows-only screen-change native refresh")
+    def test_windows_screen_change_queues_one_nonclient_refresh(self) -> None:
+        original_refresh = self.window._refresh_windows_nonclient_frame
+        with mock.patch.object(
+            self.window, "_refresh_windows_nonclient_frame", wraps=original_refresh
+        ) as refresh:
+            self.window._on_windows_screen_changed(self.window.screen())
+            self.window._on_windows_screen_changed(self.window.screen())
+            QTest.qWait(1)
+            self.assertEqual(refresh.call_count, 1)
+            self.assertFalse(self.window._screen_change_refresh_pending)
+
+    @unittest.skipUnless(IS_WINDOWS, "Windows-only screen-change native refresh")
+    def test_windows_nonclient_refresh_does_not_move_or_activate_window(self) -> None:
+        hwnd = self.window._hwnd()
+        with mock.patch.object(fw.user32, "SetWindowPos", return_value=True) as set_pos, mock.patch.object(
+            self.window, "_apply_windows_dwm_options"
+        ) as apply_dwm:
+            self.window._refresh_windows_nonclient_frame(hwnd)
+
+        set_pos.assert_called_once()
+        args = set_pos.call_args.args
+        self.assertIsNotNone(args[0])
+        self.assertEqual(args[2:6], (0, 0, 0, 0))
+        self.assertEqual(
+            args[6],
+            fw.SWP_NOMOVE | fw.SWP_NOSIZE | fw.SWP_NOZORDER
+            | fw.SWP_NOACTIVATE | fw.SWP_FRAMECHANGED,
+        )
+        apply_dwm.assert_called_once_with(hwnd)
 
     @unittest.skipUnless(IS_WINDOWS, "Windows-only DWM border behavior")
     def test_windows_maximized_window_does_not_show_a_dwm_border_gap(self) -> None:

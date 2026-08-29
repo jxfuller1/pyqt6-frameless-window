@@ -16,6 +16,7 @@ IS_MACOS = sys.platform == "darwin"
 if IS_WINDOWS:
     user32 = ctypes.windll.user32
     dwmapi = ctypes.windll.dwmapi
+    shell32 = ctypes.windll.shell32
 
     WM_NCCALCSIZE = 0x0083
     WM_NCACTIVATE = 0x0086
@@ -72,6 +73,17 @@ if IS_WINDOWS:
     SWP_NOACTIVATE = 0x0010
     SWP_FRAMECHANGED = 0x0020
 
+    # Shell app-bar APIs used to keep a maximized client frame from covering a
+    # per-monitor auto-hide taskbar.  Two physical pixels match Windows'
+    # conventional reveal strip while remaining independent of Qt's logical
+    # coordinate system.
+    ABM_GETAUTOHIDEBAREX = 0x0000000B
+    ABE_LEFT = 0
+    ABE_TOP = 1
+    ABE_RIGHT = 2
+    ABE_BOTTOM = 3
+    AUTO_HIDE_TASKBAR_INSET = 2
+
     DWMWA_USE_IMMERSIVE_DARK_MODE = 20
     DWMWA_WINDOW_CORNER_PREFERENCE = 33
     DWMWA_BORDER_COLOR = 34
@@ -109,6 +121,16 @@ if IS_WINDOWS:
     class MONITORINFO(ctypes.Structure):
         _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", RECT),
                     ("rcWork", RECT), ("dwFlags", wintypes.DWORD)]
+
+    class APPBARDATA(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("hWnd", wintypes.HWND),
+            ("uCallbackMessage", wintypes.UINT),
+            ("uEdge", wintypes.UINT),
+            ("rc", RECT),
+            ("lParam", ctypes.c_ssize_t),
+        ]
 
     user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
     user32.GetWindowLongPtrW.argtypes = (wintypes.HWND, ctypes.c_int)
@@ -148,6 +170,8 @@ if IS_WINDOWS:
     user32.DefWindowProcW.argtypes = (
         wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
     )
+    shell32.SHAppBarMessage.restype = ctypes.c_size_t
+    shell32.SHAppBarMessage.argtypes = (wintypes.DWORD, ctypes.POINTER(APPBARDATA))
     get_dpi_for_window = getattr(user32, "GetDpiForWindow", None)
     if get_dpi_for_window is not None:
         get_dpi_for_window.restype = wintypes.UINT
@@ -504,6 +528,7 @@ class FramelessMainWindow(QMainWindow):
         # restore button for that round trip.
         self._chrome_maximized = False
         self._minimized_from_maximized = False
+        self._screen_change_refresh_pending = False
         self.setWindowTitle("Frameless PyQt6 Window")
         self.resize(1100, 700)
         self.setMinimumSize(330, 200)
@@ -553,6 +578,7 @@ class FramelessMainWindow(QMainWindow):
         self.winId()  # Ensure native handle exists.
         if IS_WINDOWS:
             self._configure_native_window()
+            self._connect_windows_screen_changed()
         elif IS_MACOS:
             _configure_macos_nswindow(self)
 
@@ -807,37 +833,66 @@ class FramelessMainWindow(QMainWindow):
             style &= ~WS_CAPTION
             style |= WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX
             user32.SetWindowLongPtrW(hwnd, GWL_STYLE, style)
+            self._refresh_windows_nonclient_frame(hwnd)
+
+        def _connect_windows_screen_changed(self) -> None:
+            """Refresh native chrome when Qt moves the HWND to another screen."""
+            handle = self.windowHandle()
+            if handle is not None:
+                handle.screenChanged.connect(self._on_windows_screen_changed)
+
+        def _on_windows_screen_changed(self, _screen=None) -> None:
+            # Let Qt complete its DPI/screen transition first.  Coalescing also
+            # avoids redundant DWM calls when a move crosses monitor boundaries.
+            if self._screen_change_refresh_pending:
+                return
+            self._screen_change_refresh_pending = True
+            QTimer.singleShot(0, self._refresh_windows_nonclient_frame)
+
+        def _refresh_windows_nonclient_frame(self, hwnd_value: int | None = None) -> None:
+            """Re-read non-client style and DWM state without changing the window."""
+            self._screen_change_refresh_pending = False
+            hwnd_number = hwnd_value if hwnd_value is not None else self._hwnd()
+            if not hwnd_number:
+                return
             # Tell Windows to re-read the modified non-client style immediately.
             # Without SWP_FRAMECHANGED, stale caption buttons can remain visible
             # until a later unrelated geometry change.
             user32.SetWindowPos(
-                wintypes.HWND(hwnd), None, 0, 0, 0, 0,
+                wintypes.HWND(hwnd_number), None, 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
             )
-            self._apply_windows_dwm_options()
+            self._apply_windows_dwm_options(hwnd_number)
 
         def _apply_windows_dwm_options(self, hwnd_value: int | None = None) -> None:
+            # DWM is present on supported Qt Windows versions, but individual
+            # attributes vary by Windows build and composition/backend. Keep
+            # appearance enhancements best-effort so software rendering or an
+            # older compositor cannot prevent the window from starting.
             hwnd = wintypes.HWND(hwnd_value if hwnd_value is not None else self._hwnd())
+            def set_attribute(attribute: int, value) -> None:
+                try:
+                    dwmapi.DwmSetWindowAttribute(
+                        hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value)
+                    )
+                except (AttributeError, OSError):
+                    pass
+
             corner = ctypes.c_int(DWMWCP_ROUND)
-            dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
-                                         ctypes.byref(corner), ctypes.sizeof(corner))
+            set_attribute(DWMWA_WINDOW_CORNER_PREFERENCE, corner)
             # WS_THICKFRAME is necessary for native resize behavior, but on
             # Windows 11 DWM can draw a visible one-pixel frame around this
             # otherwise frameless window (especially noticeable while maximized).
             # Hide that DWM border consistently; unsupported builds report an
             # HRESULT and keep their normal appearance.
             border_color = ctypes.c_uint(DWMWA_COLOR_NONE)
-            dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR,
-                                         ctypes.byref(border_color), ctypes.sizeof(border_color))
+            set_attribute(DWMWA_BORDER_COLOR, border_color)
             dark = wintypes.BOOL(self._dark_mode)
-            dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
-                                         ctypes.byref(dark), ctypes.sizeof(dark))
+            set_attribute(DWMWA_USE_IMMERSIVE_DARK_MODE, dark)
             backdrop = ctypes.c_int(self._backdrop_type)
             # Attribute 38 is supported on modern Windows 11. An unsupported
-            # build reports an HRESULT; it does not raise a Python exception.
-            # Ignoring that result deliberately leaves the normal DWM backdrop.
-            dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE,
-                                         ctypes.byref(backdrop), ctypes.sizeof(backdrop))
+            # build reports an HRESULT; ignoring it leaves the normal backdrop.
+            set_attribute(DWMWA_SYSTEMBACKDROP_TYPE, backdrop)
 
         @staticmethod
         def _screen_to_client_native(hwnd: int, x: int, y: int) -> tuple[int, int]:
@@ -912,6 +967,7 @@ class FramelessMainWindow(QMainWindow):
             if not user32.GetMonitorInfoW(monitor, ctypes.byref(mi)):
                 return
             work, mon = mi.rcWork, mi.rcMonitor
+            work = self._work_area_with_auto_hide_taskbar_inset(work, mon)
             mmi.ptMaxPosition.x = work.left - mon.left
             mmi.ptMaxPosition.y = work.top - mon.top
             mmi.ptMaxSize.x = work.right - work.left
@@ -920,6 +976,42 @@ class FramelessMainWindow(QMainWindow):
             minimum = self.minimumSize()
             mmi.ptMinTrackSize.x = max(mmi.ptMinTrackSize.x, round(minimum.width() * dpr))
             mmi.ptMinTrackSize.y = max(mmi.ptMinTrackSize.y, round(minimum.height() * dpr))
+
+        @classmethod
+        def _work_area_with_auto_hide_taskbar_inset(
+            cls, work_area: RECT, monitor_rect: RECT
+        ) -> RECT:
+            work = RECT(work_area.left, work_area.top, work_area.right, work_area.bottom)
+            edge = cls._auto_hide_taskbar_edge(monitor_rect)
+            if edge == ABE_LEFT:
+                work.left += AUTO_HIDE_TASKBAR_INSET
+            elif edge == ABE_TOP:
+                work.top += AUTO_HIDE_TASKBAR_INSET
+            elif edge == ABE_RIGHT:
+                work.right -= AUTO_HIDE_TASKBAR_INSET
+            elif edge == ABE_BOTTOM:
+                work.bottom -= AUTO_HIDE_TASKBAR_INSET
+            return work
+
+        @staticmethod
+        def _auto_hide_taskbar_edge(monitor_rect: RECT) -> int | None:
+            """Return this monitor's auto-hide taskbar edge, if it has one.
+
+            ``ABM_GETAUTOHIDEBAREX`` is per-monitor.  Its rectangles are native
+            physical pixels, matching ``WM_GETMINMAXINFO`` exactly, so no Qt DPR
+            conversion is needed here.
+            """
+            for edge in (ABE_LEFT, ABE_TOP, ABE_RIGHT, ABE_BOTTOM):
+                appbar = APPBARDATA()
+                appbar.cbSize = ctypes.sizeof(APPBARDATA)
+                appbar.uEdge = edge
+                appbar.rc = RECT(
+                    monitor_rect.left, monitor_rect.top,
+                    monitor_rect.right, monitor_rect.bottom,
+                )
+                if shell32.SHAppBarMessage(ABM_GETAUTOHIDEBAREX, ctypes.byref(appbar)):
+                    return edge
+            return None
 
         def _set_max_button_pressed(self, pressed: bool) -> None:
             self._max_button_pressed = pressed
