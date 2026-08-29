@@ -56,6 +56,23 @@ class FramelessMainWindowTests(unittest.TestCase):
             self.window.setWindowsBackdrop("none")
             self.assertEqual(self.window._backdrop_type, 1)
 
+    def test_custom_title_bar_color_is_applied_and_can_be_reset(self) -> None:
+        self.window.setTitleBarColor("#2563eb", "#1e3a8a")
+        self.app.processEvents()
+        self.assertEqual(self.window.titleBarColor().name(), "#2563eb")
+        self.assertTrue(self.window.titleBar().dark_mode)
+        self.assertIn("rgba(37,99,235,255)", self.window.styleSheet())
+        self.assertIn("rgba(30,58,138,255)", self.window.styleSheet())
+        rendered_color = self.window.titleBar().grab().toImage().pixelColor(300, 20)
+        self.assertEqual(rendered_color.getRgb(), (37, 99, 235, 255))
+
+        self.window.resetTitleBarColor()
+        self.assertEqual(self.window.titleBarColor().name(), "#2d2d30")
+        self.assertTrue(self.window.titleBar().dark_mode)
+
+        with self.assertRaises(ValueError):
+            self.window.setTitleBarColor("not a color")
+
     @unittest.skipUnless(IS_WINDOWS, "Windows-only native hit test")
     def test_windows_caption_hit_test_uses_title_bar_geometry(self) -> None:
         dpr = self.window._window_dpr()
@@ -64,6 +81,22 @@ class FramelessMainWindowTests(unittest.TestCase):
             self.window._caption_hit_test((left + right) // 2, (top + bottom) // 2, dpr),
             fw.HTCAPTION,
         )
+
+    @unittest.skipUnless(IS_WINDOWS, "Windows-only custom caption controls")
+    def test_windows_caption_styles_do_not_draw_native_buttons(self) -> None:
+        style = fw.user32.GetWindowLongPtrW(self.window._hwnd(), fw.GWL_STYLE)
+        native_caption_bits = fw.WS_CAPTION | fw.WS_SYSMENU | fw.WS_MINIMIZEBOX
+        self.assertEqual(style & native_caption_bits, 0)
+        self.assertTrue(style & fw.WS_THICKFRAME)
+        self.assertTrue(style & fw.WS_MAXIMIZEBOX)
+
+        dpr = self.window._window_dpr()
+        for button in (self.window.titleBar().min_button, self.window.titleBar().close_button):
+            left, top, right, bottom = self.window._native_rect(button, dpr)
+            self.assertEqual(
+                self.window._caption_hit_test((left + right) // 2, (top + bottom) // 2, dpr),
+                fw.HTCLIENT,
+            )
 
     @unittest.skipUnless(IS_WINDOWS, "Windows-only native messages")
     def test_windows_unhandled_messages_and_caption_hit_are_safe(self) -> None:

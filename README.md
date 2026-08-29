@@ -56,8 +56,14 @@ Windows smoke test.
 ```python
 window.setDarkMode(False)
 window.setWindowsBackdrop("mica")  # auto, none, mica, acrylic, or mica_alt
+window.setTitleBarColor("#2563eb")
+window.setTitleBarColor("#2563eb", "#1e3a8a")  # active, inactive
+window.resetTitleBarColor()
 ```
 
 Backdrop materials are available only on supported Windows 11 releases. They
 are best-effort settings: unsupported Windows versions keep the normal DWM
 appearance rather than failing to open the application.
+
+`setTitleBarColor()` accepts any `QColor`-supported color name or CSS-style
+color string. It automatically selects a contrasting title/button glyph color.
