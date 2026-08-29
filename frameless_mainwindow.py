@@ -4,7 +4,7 @@ import ctypes
 import sys
 from ctypes import wintypes
 
-from PyQt6.QtCore import QPoint, QTimer, Qt
+from PyQt6.QtCore import QPoint, QRect, QTimer, Qt
 from PyQt6.QtGui import QColor, QFont, QIcon, QMouseEvent, QPainter, QPen
 from PyQt6.QtWidgets import QApplication, QLabel, QMainWindow, QPushButton, QStyle, QVBoxLayout, QWidget
 
@@ -403,14 +403,13 @@ class CustomTitleBar(QWidget):
                 global_pos - self._drag_press_global
             ).manhattanLength() >= QApplication.startDragDistance():
                 if self._drag_was_maximized:
-                    normal_geometry = self._host_window.normalGeometry()
-                    if normal_geometry.isEmpty():
-                        normal_geometry = self._host_window.geometry()
+                    normal_geometry = self._host_window._normal_geometry_for_restore()
                     horizontal_fraction = self._drag_press_local.x() / max(1, self.width())
-                    self._host_window.showNormal()
-                    self._host_window.move(
-                        global_pos.x() - round(normal_geometry.width() * horizontal_fraction),
-                        global_pos.y() - min(self._drag_press_local.y(), self.HEIGHT - 1),
+                    self._host_window._restore_normal_geometry(
+                        QPoint(
+                            global_pos.x() - round(normal_geometry.width() * horizontal_fraction),
+                            global_pos.y() - min(self._drag_press_local.y(), self.HEIGHT - 1),
+                        )
                     )
                     # Do not repeatedly restore/reposition if a platform does
                     # not support startSystemMove() for this window.
@@ -494,6 +493,7 @@ class FramelessMainWindow(QMainWindow):
         self._title_bar_color: QColor | None = None
         self._inactive_title_bar_color: QColor | None = None
         self._max_button_pressed = False
+        self._saved_normal_geometry: QRect | None = None
         self.setWindowTitle("Frameless PyQt6 Window")
         self.resize(1100, 700)
         self.setMinimumSize(330, 200)
@@ -623,9 +623,17 @@ class FramelessMainWindow(QMainWindow):
 
     def toggleMaximized(self) -> None:
         if self._is_chrome_maximized():
-            self.showNormal()
+            self._restore_normal_geometry()
         else:
             self.showMaximized()
+
+    def showMaximized(self) -> None:
+        """Maximize while retaining the exact pre-maximize Qt geometry."""
+        if not self._is_chrome_maximized() and not self.isMinimized():
+            geometry = self.geometry()
+            if geometry.isValid():
+                self._saved_normal_geometry = QRect(geometry)
+        super().showMaximized()
 
     def titleBar(self) -> CustomTitleBar:
         return self.title_bar
@@ -645,6 +653,22 @@ class FramelessMainWindow(QMainWindow):
             if hwnd:
                 return bool(user32.IsZoomed(wintypes.HWND(hwnd)))
         return False
+
+    def _normal_geometry_for_restore(self) -> QRect:
+        """Return the normal bounds remembered before the current maximize."""
+        if self._saved_normal_geometry is not None and self._saved_normal_geometry.isValid():
+            return QRect(self._saved_normal_geometry)
+        geometry = self.normalGeometry()
+        return QRect(geometry if geometry.isValid() else self.geometry())
+
+    def _restore_normal_geometry(self, top_left: QPoint | None = None) -> None:
+        """Leave maximized state and restore the saved normal bounds exactly."""
+        geometry = self._normal_geometry_for_restore()
+        super().showNormal()
+        if geometry.isValid():
+            if top_left is not None:
+                geometry.moveTopLeft(top_left)
+            self.setGeometry(geometry)
 
     # ----------------------------- Qt events ------------------------------
     @staticmethod
