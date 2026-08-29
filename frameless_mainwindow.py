@@ -40,6 +40,7 @@ if IS_WINDOWS:
     HTCLOSE = 20
 
     GWL_STYLE = -16
+    WS_CAPTION = 0x00C00000
     WS_THICKFRAME = 0x00040000
     WS_MINIMIZEBOX = 0x00020000
     WS_MAXIMIZEBOX = 0x00010000
@@ -118,11 +119,6 @@ if IS_WINDOWS:
     dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long  # HRESULT
     dwmapi.DwmSetWindowAttribute.argtypes = (
         wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
-    )
-    dwmapi.DwmDefWindowProc.restype = wintypes.BOOL
-    dwmapi.DwmDefWindowProc.argtypes = (
-        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
-        ctypes.POINTER(ctypes.c_ssize_t),
     )
 
 
@@ -256,6 +252,7 @@ class CustomTitleBar(QWidget):
         self.active = True
         self.dark_mode = True
         self.setObjectName("customTitleBar")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setFixedHeight(self.HEIGHT)
 
         self.icon = QLabel(self)
@@ -358,7 +355,7 @@ class FramelessMainWindow(QMainWindow):
     Windows:
       - Native 8-way resizing, move, Aero Snap and Win+Arrow
       - Windows 11 maximize-button Snap Layout flyout via HTMAXBUTTON
-      - Native system menu (title-bar right click and app-icon interactions)
+      - System menu on title-bar right click
       - DWM shadow, rounded corners, active/inactive chrome
       - Correct taskbar-aware maximize and per-monitor DPI-aware hit testing
       - Optional Win11 Mica/Mica Alt/system backdrop API
@@ -379,6 +376,8 @@ class FramelessMainWindow(QMainWindow):
         super().__init__(parent)
         self._dark_mode = True
         self._backdrop_type = 0
+        self._title_bar_color: QColor | None = None
+        self._inactive_title_bar_color: QColor | None = None
         self.setWindowTitle("Frameless PyQt6 Window")
         self.resize(1100, 700)
         self.setMinimumSize(330, 200)
@@ -448,6 +447,35 @@ class FramelessMainWindow(QMainWindow):
         if IS_WINDOWS and int(self.winId()):
             self._apply_windows_dwm_options()
 
+    def setTitleBarColor(
+        self, color: QColor | str, inactive_color: QColor | str | None = None
+    ) -> None:
+        """Set the active title-bar color.
+
+        ``color`` accepts any QColor-supported name or CSS-style color, such
+        as ``"#2563eb"`` or ``"steelblue"``. Supply ``inactive_color`` to
+        explicitly control the inactive-window color; otherwise a slightly
+        darker shade of the active color is used.
+        """
+        self._title_bar_color = self._coerce_color(color, "color")
+        self._inactive_title_bar_color = (
+            self._coerce_color(inactive_color, "inactive_color")
+            if inactive_color is not None
+            else None
+        )
+        self._apply_palette()
+
+    def resetTitleBarColor(self) -> None:
+        """Restore the title-bar colors selected by :meth:`setDarkMode`."""
+        self._title_bar_color = None
+        self._inactive_title_bar_color = None
+        self._apply_palette()
+
+    def titleBarColor(self) -> QColor:
+        """Return the effective active title-bar color."""
+        active, _ = self._effective_title_bar_colors()
+        return QColor(active)
+
     def setMicaEnabled(self, enabled: bool = True) -> None:
         """Enable Win11 Mica backdrop where supported; no-op elsewhere.
 
@@ -490,25 +518,67 @@ class FramelessMainWindow(QMainWindow):
         return self.content
 
     # ----------------------------- Qt events ------------------------------
+    @staticmethod
+    def _coerce_color(color: QColor | str, parameter: str) -> QColor:
+        converted = QColor(color)
+        if not converted.isValid():
+            raise ValueError(f"{parameter} must be a valid QColor or color name")
+        return converted
+
+    @staticmethod
+    def _color_to_css(color: QColor) -> str:
+        return f"rgba({color.red()},{color.green()},{color.blue()},{color.alpha()})"
+
+    @staticmethod
+    def _title_bar_uses_dark_chrome(color: QColor) -> bool:
+        """Choose white glyphs for backgrounds with low relative luminance."""
+        def linear(channel: int) -> float:
+            value = channel / 255.0
+            return value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
+
+        luminance = (
+            0.2126 * linear(color.red())
+            + 0.7152 * linear(color.green())
+            + 0.0722 * linear(color.blue())
+        )
+        return luminance < 0.42
+
+    def _effective_title_bar_colors(self) -> tuple[QColor, QColor]:
+        if self._title_bar_color is None:
+            if self._dark_mode:
+                return QColor(45, 45, 48), QColor(39, 39, 41)
+            return QColor(243, 243, 243), QColor(238, 238, 238)
+
+        active = QColor(self._title_bar_color)
+        inactive = (
+            QColor(self._inactive_title_bar_color)
+            if self._inactive_title_bar_color is not None
+            else active.darker(115)
+        )
+        return active, inactive
+
     def _apply_palette(self) -> None:
         if not hasattr(self, "root"):
             return
+        active_title_bar, inactive_title_bar = self._effective_title_bar_colors()
+        title_bar_style = (
+            f"#customTitleBar{{background:{self._color_to_css(active_title_bar)};}}"
+            f"#customTitleBar[activeWindow=\"false\"]{{background:{self._color_to_css(inactive_title_bar)};}}"
+        )
         if self._dark_mode:
             self.setStyleSheet(
                 "#windowRoot{background:rgb(32,32,32);}"
-                "#customTitleBar{background:rgb(45,45,48);}"
-                "#customTitleBar[activeWindow=\"false\"]{background:rgb(39,39,41);}"
-                "QLabel{color:rgb(230,230,230);}"
+                + title_bar_style
+                + "QLabel{color:rgb(230,230,230);}"
             )
         else:
             self.setStyleSheet(
                 "#windowRoot{background:rgb(248,248,248);}"
-                "#customTitleBar{background:rgb(243,243,243);}"
-                "#customTitleBar[activeWindow=\"false\"]{background:rgb(238,238,238);}"
-                "QLabel{color:rgb(30,30,30);}"
+                + title_bar_style
+                + "QLabel{color:rgb(30,30,30);}"
             )
         if hasattr(self, "title_bar"):
-            self.title_bar.setDarkMode(self._dark_mode)
+            self.title_bar.setDarkMode(self._title_bar_uses_dark_chrome(active_title_bar))
 
     def changeEvent(self, event):
         super().changeEvent(event)
@@ -535,11 +605,17 @@ class FramelessMainWindow(QMainWindow):
         def _configure_native_window(self) -> None:
             hwnd = self._hwnd()
             style = user32.GetWindowLongPtrW(hwnd, GWL_STYLE)
-            style |= WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU
+            # FramelessWindowHint does not always strip all caption-button bits
+            # after Qt creates the HWND. Keeping WS_SYSMENU / WS_MINIMIZEBOX
+            # makes Windows paint a second caption-button set over the custom
+            # controls. Retain only the resize frame and maximize capability
+            # required for edge resize and Windows 11 Snap Layouts.
+            style &= ~(WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX)
+            style |= WS_THICKFRAME | WS_MAXIMIZEBOX
             user32.SetWindowLongPtrW(hwnd, GWL_STYLE, style)
             # Tell Windows to re-read the modified non-client style immediately.
-            # Without SWP_FRAMECHANGED, the added system-menu and resize styles
-            # can remain stale until a later unrelated geometry change.
+            # Without SWP_FRAMECHANGED, stale caption buttons can remain visible
+            # until a later unrelated geometry change.
             user32.SetWindowPos(
                 wintypes.HWND(hwnd), None, 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
@@ -596,11 +672,11 @@ class FramelessMainWindow(QMainWindow):
             if inside(self._native_rect(tb.icon, dpr)):
                 return HTSYSMENU
             if inside(self._native_rect(tb.close_button, dpr)):
-                return HTCLOSE
+                return HTCLIENT
             if inside(self._native_rect(tb.max_button, dpr)):
                 return HTMAXBUTTON  # Required for Windows 11 Snap Layout hover.
             if inside(self._native_rect(tb.min_button, dpr)):
-                return HTMINBUTTON
+                return HTCLIENT
             return HTCAPTION
 
         def _resize_hit_test(self, x: int, y: int, dpr: float) -> int | None:
@@ -661,15 +737,6 @@ class FramelessMainWindow(QMainWindow):
                 return True, 0
 
             if msg.message == WM_NCHITTEST:
-                # DWM gets the first opportunity to identify any non-client
-                # regions it owns. This is required for custom frames on Vista+
-                # and keeps future DWM behavior from being shadowed by our hit
-                # testing.
-                dwm_result = ctypes.c_ssize_t()
-                if dwmapi.DwmDefWindowProc(
-                    msg.hwnd, msg.message, msg.wParam, msg.lParam, ctypes.byref(dwm_result)
-                ):
-                    return True, int(dwm_result.value)
                 screen_x = _signed_word(int(msg.lParam))
                 screen_y = _signed_word(int(msg.lParam) >> 16)
                 x, y = self._screen_to_client_native(int(msg.hwnd), screen_x, screen_y)
