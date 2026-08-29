@@ -36,6 +36,7 @@ if IS_WINDOWS:
     WM_SYSCOMMAND = 0x0112
 
     SC_MINIMIZE = 0xF020
+    SC_MAXIMIZE = 0xF030
     SC_RESTORE = 0xF120
 
     HTCLIENT = 1
@@ -497,6 +498,12 @@ class FramelessMainWindow(QMainWindow):
         self._inactive_title_bar_color: QColor | None = None
         self._max_button_pressed = False
         self._saved_normal_geometry: QRect | None = None
+        # Qt's reported maximized state can briefly disagree with Explorer
+        # after a maximized window is minimized and restored from the taskbar.
+        # Keep the chrome state independently so the custom button stays a
+        # restore button for that round trip.
+        self._chrome_maximized = False
+        self._minimized_from_maximized = False
         self.setWindowTitle("Frameless PyQt6 Window")
         self.resize(1100, 700)
         self.setMinimumSize(330, 200)
@@ -636,7 +643,20 @@ class FramelessMainWindow(QMainWindow):
             geometry = self.geometry()
             if geometry.isValid():
                 self._saved_normal_geometry = QRect(geometry)
+        self._chrome_maximized = True
+        self._minimized_from_maximized = False
         super().showMaximized()
+
+    def showMinimized(self) -> None:
+        """Minimize while remembering whether taskbar restore should be maximized."""
+        self._minimized_from_maximized = self._is_chrome_maximized()
+        super().showMinimized()
+
+    def showNormal(self) -> None:
+        """Explicitly restore to the normal window state."""
+        self._chrome_maximized = False
+        self._minimized_from_maximized = False
+        super().showNormal()
 
     def titleBar(self) -> CustomTitleBar:
         return self.title_bar
@@ -646,6 +666,8 @@ class FramelessMainWindow(QMainWindow):
 
     def _is_chrome_maximized(self, hwnd_value: int | None = None) -> bool:
         """Return the actual maximize state used for caption behavior."""
+        if self._chrome_maximized:
+            return True
         if self.isMaximized():
             return True
         if IS_WINDOWS:
@@ -667,6 +689,8 @@ class FramelessMainWindow(QMainWindow):
     def _restore_normal_geometry(self, top_left: QPoint | None = None) -> None:
         """Leave maximized state and restore the saved normal bounds exactly."""
         geometry = self._normal_geometry_for_restore()
+        self._chrome_maximized = False
+        self._minimized_from_maximized = False
         super().showNormal()
         if geometry.isValid():
             if top_left is not None:
@@ -947,6 +971,22 @@ class FramelessMainWindow(QMainWindow):
 
         def nativeEvent(self, eventType, message):
             msg = ctypes.cast(int(message), ctypes.POINTER(MSG)).contents
+
+            if msg.message == WM_SYSCOMMAND:
+                command = int(msg.wParam) & 0xFFF0
+                if command == SC_MINIMIZE:
+                    self._minimized_from_maximized = self._is_chrome_maximized(
+                        int(msg.hwnd)
+                    )
+                elif command == SC_MAXIMIZE:
+                    self._chrome_maximized = True
+                    self._minimized_from_maximized = False
+                elif command == SC_RESTORE:
+                    # Explorer's taskbar restore can arrive before Qt updates
+                    # WindowState. Preserve the preceding maximize state so
+                    # the custom button restores the saved normal geometry.
+                    self._chrome_maximized = self._minimized_from_maximized
+                    self._minimized_from_maximized = False
 
             if msg.message == WM_NCACTIVATE:
                 # WS_THICKFRAME is retained for native edge-resize behavior, but

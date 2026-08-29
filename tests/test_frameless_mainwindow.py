@@ -232,12 +232,17 @@ class FramelessMainWindowTests(unittest.TestCase):
         self.window.showMinimized()
         self.app.processEvents()
 
-        show_window = fw.user32.ShowWindow
-        show_window.restype = fw.wintypes.BOOL
-        show_window.argtypes = (fw.wintypes.HWND, ctypes.c_int)
-        show_window(fw.wintypes.HWND(hwnd), 9)  # SW_RESTORE, as taskbar activation does.
+        # Explorer restores a taskbar window through WM_SYSCOMMAND/SC_RESTORE.
+        # That path can briefly make Qt report a normal window even when the
+        # window should retain the prior maximized state.
+        self.assertTrue(
+            fw.user32.PostMessageW(
+                fw.wintypes.HWND(hwnd), fw.WM_SYSCOMMAND, fw.SC_RESTORE, 0
+            )
+        )
         self.app.processEvents()
         self.assertTrue(self.window._is_chrome_maximized())
+        self.assertEqual(self.window.titleBar().max_button.kind, "restore")
 
         dpr = self.window._window_dpr(hwnd)
         left, top, right, bottom = self.window._native_rect(
