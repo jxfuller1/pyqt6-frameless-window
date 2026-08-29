@@ -18,9 +18,16 @@ if IS_WINDOWS:
     dwmapi = ctypes.windll.dwmapi
 
     WM_NCCALCSIZE = 0x0083
+    WM_NCACTIVATE = 0x0086
     WM_NCHITTEST = 0x0084
     WM_GETMINMAXINFO = 0x0024
+    WM_NCLBUTTONDOWN = 0x00A1
+    WM_NCLBUTTONUP = 0x00A2
+    WM_NCLBUTTONDBLCLK = 0x00A3
     WM_NCRBUTTONUP = 0x00A5
+    WM_LBUTTONUP = 0x0202
+    WM_CANCELMODE = 0x001F
+    WM_CAPTURECHANGED = 0x0215
     WM_DPICHANGED = 0x02E0
     WM_SYSCOMMAND = 0x0112
 
@@ -108,6 +115,16 @@ if IS_WINDOWS:
     user32.SetWindowPos.argtypes = (
         wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
         ctypes.c_int, ctypes.c_int, wintypes.UINT,
+    )
+    user32.SetCapture.restype = wintypes.HWND
+    user32.SetCapture.argtypes = (wintypes.HWND,)
+    user32.GetCapture.restype = wintypes.HWND
+    user32.GetCapture.argtypes = ()
+    user32.ReleaseCapture.restype = wintypes.BOOL
+    user32.ReleaseCapture.argtypes = ()
+    user32.DefWindowProcW.restype = ctypes.c_ssize_t
+    user32.DefWindowProcW.argtypes = (
+        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
     )
     get_dpi_for_window = getattr(user32, "GetDpiForWindow", None)
     if get_dpi_for_window is not None:
@@ -378,6 +395,7 @@ class FramelessMainWindow(QMainWindow):
         self._backdrop_type = 0
         self._title_bar_color: QColor | None = None
         self._inactive_title_bar_color: QColor | None = None
+        self._max_button_pressed = False
         self.setWindowTitle("Frameless PyQt6 Window")
         self.resize(1100, 700)
         self.setMinimumSize(330, 200)
@@ -715,6 +733,41 @@ class FramelessMainWindow(QMainWindow):
             mmi.ptMinTrackSize.x = max(mmi.ptMinTrackSize.x, round(minimum.width() * dpr))
             mmi.ptMinTrackSize.y = max(mmi.ptMinTrackSize.y, round(minimum.height() * dpr))
 
+        def _set_max_button_pressed(self, pressed: bool) -> None:
+            self._max_button_pressed = pressed
+            self.title_bar.max_button.setDown(pressed)
+
+        def _max_button_contains_native_point(self, x: int, y: int, dpr: float) -> bool:
+            left, top, right, bottom = self._native_rect(self.title_bar.max_button, dpr)
+            return left <= x < right and top <= y < bottom
+
+        def _begin_max_button_press(
+            self, hwnd_value: int, screen_x: int, screen_y: int
+        ) -> bool:
+            x, y = self._screen_to_client_native(hwnd_value, screen_x, screen_y)
+            dpr = self._window_dpr(hwnd_value)
+            if not self._max_button_contains_native_point(x, y, dpr):
+                return False
+            self._set_max_button_pressed(True)
+            user32.SetCapture(wintypes.HWND(hwnd_value))
+            return True
+
+        def _clear_max_button_press(self, hwnd_value: int) -> None:
+            self._set_max_button_pressed(False)
+            if int(user32.GetCapture() or 0) == hwnd_value:
+                user32.ReleaseCapture()
+
+        def _finish_max_button_press(
+            self, hwnd_value: int, x: int, y: int, dpr: float
+        ) -> None:
+            should_toggle = (
+                self._max_button_pressed
+                and self._max_button_contains_native_point(x, y, dpr)
+            )
+            self._clear_max_button_press(hwnd_value)
+            if should_toggle:
+                self.toggleMaximized()
+
         @staticmethod
         def _show_system_menu(hwnd_value: int, screen_x: int, screen_y: int) -> None:
             hwnd = wintypes.HWND(hwnd_value)
@@ -729,7 +782,54 @@ class FramelessMainWindow(QMainWindow):
         def nativeEvent(self, eventType, message):
             msg = ctypes.cast(int(message), ctypes.POINTER(MSG)).contents
 
+            if msg.message == WM_NCACTIVATE:
+                # WS_THICKFRAME is retained for native edge-resize behavior, but
+                # Windows otherwise repaints that invisible non-client frame on
+                # activation. A -1 lParam preserves normal activation while
+                # explicitly telling DefWindowProc not to repaint it.
+                result = user32.DefWindowProcW(
+                    wintypes.HWND(int(msg.hwnd)),
+                    wintypes.UINT(msg.message),
+                    wintypes.WPARAM(int(msg.wParam)),
+                    wintypes.LPARAM(-1),
+                )
+                return True, int(result)
+
             if msg.message == WM_NCCALCSIZE:
+                return True, 0
+
+            if (
+                msg.message in (WM_NCLBUTTONDOWN, WM_NCLBUTTONDBLCLK)
+                and int(msg.wParam) == HTMAXBUTTON
+            ):
+                # HTMAXBUTTON is necessary for the Windows 11 Snap Layout hover,
+                # but the default non-client click handler would also paint and
+                # track a second native maximize button. Keep the hit-test result
+                # for Snap and capture the click for the custom button instead.
+                screen_x = _signed_word(int(msg.lParam))
+                screen_y = _signed_word(int(msg.lParam) >> 16)
+                if self._begin_max_button_press(int(msg.hwnd), screen_x, screen_y):
+                    return True, 0
+
+            if msg.message == WM_NCLBUTTONUP and self._max_button_pressed:
+                screen_x = _signed_word(int(msg.lParam))
+                screen_y = _signed_word(int(msg.lParam) >> 16)
+                x, y = self._screen_to_client_native(int(msg.hwnd), screen_x, screen_y)
+                self._finish_max_button_press(
+                    int(msg.hwnd), x, y, self._window_dpr(int(msg.hwnd))
+                )
+                return True, 0
+
+            if msg.message == WM_LBUTTONUP and self._max_button_pressed:
+                x = _signed_word(int(msg.lParam))
+                y = _signed_word(int(msg.lParam) >> 16)
+                self._finish_max_button_press(
+                    int(msg.hwnd), x, y, self._window_dpr(int(msg.hwnd))
+                )
+                return True, 0
+
+            if msg.message in (WM_CANCELMODE, WM_CAPTURECHANGED) and self._max_button_pressed:
+                self._clear_max_button_press(int(msg.hwnd))
                 return True, 0
 
             if msg.message == WM_GETMINMAXINFO:
