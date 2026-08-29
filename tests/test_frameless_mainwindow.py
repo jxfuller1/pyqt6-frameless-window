@@ -281,6 +281,7 @@ class FramelessMainWindowTests(unittest.TestCase):
         )
         self.app.processEvents()
         self.assertFalse(self.window._is_chrome_maximized())
+        self.assertEqual(self.window.titleBar().max_button.kind, "max")
         self.assertEqual(self.window.frameGeometry(), normal_geometry)
 
         dpr = self.window._window_dpr(hwnd)

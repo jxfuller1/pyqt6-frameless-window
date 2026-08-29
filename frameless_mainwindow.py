@@ -646,6 +646,7 @@ class FramelessMainWindow(QMainWindow):
         self._chrome_maximized = True
         self._minimized_from_maximized = False
         super().showMaximized()
+        self._sync_maximize_button(True)
 
     def showMinimized(self) -> None:
         """Minimize while remembering whether taskbar restore should be maximized."""
@@ -657,6 +658,7 @@ class FramelessMainWindow(QMainWindow):
         self._chrome_maximized = False
         self._minimized_from_maximized = False
         super().showNormal()
+        self._sync_maximize_button(False)
 
     def titleBar(self) -> CustomTitleBar:
         return self.title_bar
@@ -696,6 +698,20 @@ class FramelessMainWindow(QMainWindow):
             if top_left is not None:
                 geometry.moveTopLeft(top_left)
             self.setGeometry(geometry)
+        # WindowState can still briefly say "maximized" after showNormal().
+        # The custom command has already restored the normal geometry, so set
+        # the glyph explicitly instead of waiting for a later activation event.
+        self._sync_maximize_button(False)
+
+    def _sync_maximize_button(self, maximized: bool | None = None) -> None:
+        """Immediately repaint the custom maximize/restore glyph."""
+        if not hasattr(self, "title_bar"):
+            return
+        if maximized is None:
+            maximized = self._is_chrome_maximized()
+        button = self.title_bar.max_button
+        button.kind = "restore" if maximized else "max"
+        button.update()
 
     # ----------------------------- Qt events ------------------------------
     @staticmethod
@@ -763,8 +779,7 @@ class FramelessMainWindow(QMainWindow):
     def changeEvent(self, event):
         super().changeEvent(event)
         if hasattr(self, "title_bar"):
-            self.title_bar.max_button.kind = "restore" if self._is_chrome_maximized() else "max"
-            self.title_bar.max_button.update()
+            self._sync_maximize_button()
             self.title_bar.setActive(self.isActiveWindow())
 
     def focusInEvent(self, event):
@@ -987,6 +1002,7 @@ class FramelessMainWindow(QMainWindow):
                     # the custom button restores the saved normal geometry.
                     self._chrome_maximized = self._minimized_from_maximized
                     self._minimized_from_maximized = False
+                self._sync_maximize_button(self._chrome_maximized)
 
             if msg.message == WM_NCACTIVATE:
                 # WS_THICKFRAME is retained for native edge-resize behavior, but
