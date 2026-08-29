@@ -11,8 +11,19 @@ level window:
 - native system menu (right-click the title bar or use `Alt`+`Space`)
 - Windows 11 Snap Layouts from the custom maximize button
 - taskbar-aware maximize bounds on every monitor
+- screen-change refresh and per-monitor auto-hide taskbar handling
 - per-monitor-DPI-aware hit testing
 - DWM shadow, rounded-corner, dark-mode, and optional system-backdrop support
+
+The window does not require a dedicated GPU. DWM appearance features are
+best-effort: unsupported attributes or older compositors safely retain the
+normal Windows appearance.
+
+## Reference
+
+Multi-monitor and taskbar edge cases were researched with the
+[PyQt-Frameless-Window project](https://github.com/zhiyiYo/PyQt-Frameless-Window).
+No GPL code from that project was copied.
 
 macOS retains the native traffic lights and window-manager behavior while
 extending content beneath the title bar. Other Qt platforms use the portable
@@ -56,8 +67,14 @@ Windows smoke test.
 ```python
 window.setDarkMode(False)
 window.setWindowsBackdrop("mica")  # auto, none, mica, acrylic, or mica_alt
+window.setTitleBarColor("#2563eb")
+window.setTitleBarColor("#2563eb", "#1e3a8a")  # active, inactive
+window.resetTitleBarColor()
 ```
 
 Backdrop materials are available only on supported Windows 11 releases. They
 are best-effort settings: unsupported Windows versions keep the normal DWM
 appearance rather than failing to open the application.
+
+`setTitleBarColor()` accepts any `QColor`-supported color name or CSS-style
+color string. It automatically selects a contrasting title/button glyph color.

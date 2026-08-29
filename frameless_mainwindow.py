@@ -4,7 +4,7 @@ import ctypes
 import sys
 from ctypes import wintypes
 
-from PyQt6.QtCore import QPoint, Qt
+from PyQt6.QtCore import QPoint, QRect, QTimer, Qt
 from PyQt6.QtGui import QColor, QFont, QIcon, QMouseEvent, QPainter, QPen
 from PyQt6.QtWidgets import QApplication, QLabel, QMainWindow, QPushButton, QStyle, QVBoxLayout, QWidget
 
@@ -16,13 +16,29 @@ IS_MACOS = sys.platform == "darwin"
 if IS_WINDOWS:
     user32 = ctypes.windll.user32
     dwmapi = ctypes.windll.dwmapi
+    shell32 = ctypes.windll.shell32
 
     WM_NCCALCSIZE = 0x0083
+    WM_NCACTIVATE = 0x0086
     WM_NCHITTEST = 0x0084
     WM_GETMINMAXINFO = 0x0024
+    WM_NCLBUTTONDOWN = 0x00A1
+    WM_NCLBUTTONUP = 0x00A2
+    WM_NCLBUTTONDBLCLK = 0x00A3
     WM_NCRBUTTONUP = 0x00A5
+    WM_NCMOUSEMOVE = 0x00A0
+    WM_LBUTTONUP = 0x0202
+    WM_MOUSEMOVE = 0x0200
+    WM_CANCELMODE = 0x001F
+    WM_CAPTURECHANGED = 0x0215
+    WM_NCMOUSELEAVE = 0x02A2
+    WM_MOUSELEAVE = 0x02A3
     WM_DPICHANGED = 0x02E0
     WM_SYSCOMMAND = 0x0112
+
+    SC_MINIMIZE = 0xF020
+    SC_MAXIMIZE = 0xF030
+    SC_RESTORE = 0xF120
 
     HTCLIENT = 1
     HTCAPTION = 2
@@ -40,6 +56,7 @@ if IS_WINDOWS:
     HTCLOSE = 20
 
     GWL_STYLE = -16
+    WS_CAPTION = 0x00C00000
     WS_THICKFRAME = 0x00040000
     WS_MINIMIZEBOX = 0x00020000
     WS_MAXIMIZEBOX = 0x00010000
@@ -48,15 +65,30 @@ if IS_WINDOWS:
     MONITOR_DEFAULTTONEAREST = 2
     TPM_RETURNCMD = 0x0100
     TPM_RIGHTBUTTON = 0x0002
+    TME_LEAVE = 0x00000002
+    TME_NONCLIENT = 0x00000010
     SWP_NOSIZE = 0x0001
     SWP_NOMOVE = 0x0002
     SWP_NOZORDER = 0x0004
     SWP_NOACTIVATE = 0x0010
     SWP_FRAMECHANGED = 0x0020
 
+    # Shell app-bar APIs used to keep a maximized client frame from covering a
+    # per-monitor auto-hide taskbar.  Two physical pixels match Windows'
+    # conventional reveal strip while remaining independent of Qt's logical
+    # coordinate system.
+    ABM_GETAUTOHIDEBAREX = 0x0000000B
+    ABE_LEFT = 0
+    ABE_TOP = 1
+    ABE_RIGHT = 2
+    ABE_BOTTOM = 3
+    AUTO_HIDE_TASKBAR_INSET = 2
+
     DWMWA_USE_IMMERSIVE_DARK_MODE = 20
     DWMWA_WINDOW_CORNER_PREFERENCE = 33
+    DWMWA_BORDER_COLOR = 34
     DWMWA_SYSTEMBACKDROP_TYPE = 38
+    DWMWA_COLOR_NONE = 0xFFFFFFFE
     DWMWCP_DEFAULT = 0
     DWMWCP_ROUND = 2
     DWMSBT_AUTO = 0
@@ -77,6 +109,10 @@ if IS_WINDOWS:
                     ("wParam", wintypes.WPARAM), ("lParam", wintypes.LPARAM),
                     ("time", wintypes.DWORD), ("pt", POINT), ("lPrivate", wintypes.DWORD)]
 
+    class TRACKMOUSEEVENT(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                    ("hwndTrack", wintypes.HWND), ("dwHoverTime", wintypes.DWORD)]
+
     class MINMAXINFO(ctypes.Structure):
         _fields_ = [("ptReserved", POINT), ("ptMaxSize", POINT),
                     ("ptMaxPosition", POINT), ("ptMinTrackSize", POINT),
@@ -85,6 +121,16 @@ if IS_WINDOWS:
     class MONITORINFO(ctypes.Structure):
         _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", RECT),
                     ("rcWork", RECT), ("dwFlags", wintypes.DWORD)]
+
+    class APPBARDATA(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("hWnd", wintypes.HWND),
+            ("uCallbackMessage", wintypes.UINT),
+            ("uEdge", wintypes.UINT),
+            ("rc", RECT),
+            ("lParam", ctypes.c_ssize_t),
+        ]
 
     user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
     user32.GetWindowLongPtrW.argtypes = (wintypes.HWND, ctypes.c_int)
@@ -96,6 +142,10 @@ if IS_WINDOWS:
     user32.GetMonitorInfoW.argtypes = (wintypes.HMONITOR, ctypes.POINTER(MONITORINFO))
     user32.ScreenToClient.restype = wintypes.BOOL
     user32.ScreenToClient.argtypes = (wintypes.HWND, ctypes.POINTER(POINT))
+    user32.GetCursorPos.restype = wintypes.BOOL
+    user32.GetCursorPos.argtypes = (ctypes.POINTER(POINT),)
+    user32.TrackMouseEvent.restype = wintypes.BOOL
+    user32.TrackMouseEvent.argtypes = (ctypes.POINTER(TRACKMOUSEEVENT),)
     user32.GetSystemMenu.restype = wintypes.HMENU
     user32.GetSystemMenu.argtypes = (wintypes.HWND, wintypes.BOOL)
     user32.TrackPopupMenu.restype = wintypes.UINT
@@ -108,6 +158,20 @@ if IS_WINDOWS:
         wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
         ctypes.c_int, ctypes.c_int, wintypes.UINT,
     )
+    user32.SetCapture.restype = wintypes.HWND
+    user32.SetCapture.argtypes = (wintypes.HWND,)
+    user32.GetCapture.restype = wintypes.HWND
+    user32.GetCapture.argtypes = ()
+    user32.ReleaseCapture.restype = wintypes.BOOL
+    user32.ReleaseCapture.argtypes = ()
+    user32.IsZoomed.restype = wintypes.BOOL
+    user32.IsZoomed.argtypes = (wintypes.HWND,)
+    user32.DefWindowProcW.restype = ctypes.c_ssize_t
+    user32.DefWindowProcW.argtypes = (
+        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+    )
+    shell32.SHAppBarMessage.restype = ctypes.c_size_t
+    shell32.SHAppBarMessage.argtypes = (wintypes.DWORD, ctypes.POINTER(APPBARDATA))
     get_dpi_for_window = getattr(user32, "GetDpiForWindow", None)
     if get_dpi_for_window is not None:
         get_dpi_for_window.restype = wintypes.UINT
@@ -118,11 +182,6 @@ if IS_WINDOWS:
     dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long  # HRESULT
     dwmapi.DwmSetWindowAttribute.argtypes = (
         wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
-    )
-    dwmapi.DwmDefWindowProc.restype = wintypes.BOOL
-    dwmapi.DwmDefWindowProc.argtypes = (
-        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
-        ctypes.POINTER(ctypes.c_ssize_t),
     )
 
 
@@ -189,6 +248,7 @@ class CaptionButton(QPushButton):
         self.kind = kind
         self.active = True
         self.dark_mode = True
+        self.native_hovered = False
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setCursor(Qt.CursorShape.ArrowCursor)
         self.setFixedWidth(46)
@@ -205,6 +265,17 @@ class CaptionButton(QPushButton):
         self._apply_style()
         self.update()
 
+    def setNativeHover(self, hovered: bool) -> None:
+        """Mirror a native non-client hover state in the Qt button style."""
+        hovered = bool(hovered)
+        if self.native_hovered == hovered:
+            return
+        self.native_hovered = hovered
+        self.setProperty("nativeHover", hovered)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
     def _apply_style(self) -> None:
         if self.kind == "close":
             self.setStyleSheet(
@@ -217,7 +288,7 @@ class CaptionButton(QPushButton):
             pressed = "rgba(255,255,255,42)" if self.dark_mode else "rgba(0,0,0,32)"
             self.setStyleSheet(
                 "QPushButton{border:0;background:transparent;}"
-                f"QPushButton:hover{{background:{hover};}}"
+                f"QPushButton:hover,QPushButton[nativeHover=\"true\"]{{background:{hover};}}"
                 f"QPushButton:pressed{{background:{pressed};}}"
             )
 
@@ -255,7 +326,12 @@ class CustomTitleBar(QWidget):
         self._host_window = window
         self.active = True
         self.dark_mode = True
+        self._drag_press_global: QPoint | None = None
+        self._drag_press_local: QPoint | None = None
+        self._drag_was_maximized = False
+        self._system_move_started = False
         self.setObjectName("customTitleBar")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setFixedHeight(self.HEIGHT)
 
         self.icon = QLabel(self)
@@ -328,22 +404,85 @@ class CustomTitleBar(QWidget):
         self.title.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
 
     def mousePressEvent(self, event: QMouseEvent):
-        # Windows native WM_NCHITTEST turns this area into HTCAPTION. The other
-        # platforms use Qt's system move operation so the compositor can retain
-        # native dragging, snapping, and tiling behavior where it supports it.
-        if not IS_WINDOWS and event.button() == Qt.MouseButton.LeftButton:
-            handle = self._host_window.windowHandle()
-            if handle and handle.startSystemMove():
-                event.accept()
-                return
+        # This is a client region on every platform. Keep a short press as a
+        # click (so double-click still maximizes), then ask the window manager
+        # to move only after the user actually drags.
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and not self._over_caption_button(event.position().toPoint())
+        ):
+            self._drag_press_global = event.globalPosition().toPoint()
+            self._drag_press_local = event.position().toPoint()
+            self._drag_was_maximized = self._host_window._is_chrome_maximized()
+            self._system_move_started = False
+            event.accept()
+            return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        if (
+            not self._system_move_started
+            and self._drag_press_global is not None
+            and self._drag_press_local is not None
+            and event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            global_pos = event.globalPosition().toPoint()
+            if (
+                global_pos - self._drag_press_global
+            ).manhattanLength() >= QApplication.startDragDistance():
+                if self._drag_was_maximized:
+                    normal_geometry = self._host_window._normal_geometry_for_restore()
+                    horizontal_fraction = self._drag_press_local.x() / max(1, self.width())
+                    self._host_window._restore_normal_geometry(
+                        QPoint(
+                            global_pos.x() - round(normal_geometry.width() * horizontal_fraction),
+                            global_pos.y() - min(self._drag_press_local.y(), self.HEIGHT - 1),
+                        )
+                    )
+                    # Do not repeatedly restore/reposition if a platform does
+                    # not support startSystemMove() for this window.
+                    self._drag_was_maximized = False
+                handle = self._host_window.windowHandle()
+                self._system_move_started = bool(handle and handle.startSystemMove())
+                if self._system_move_started:
+                    event.accept()
+                    return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._reset_drag_state()
+        super().mouseReleaseEvent(event)
+
+    def contextMenuEvent(self, event) -> None:
+        if IS_WINDOWS:
+            # TrackPopupMenu expects physical screen pixels. Qt's global point
+            # may be device-independent on a mixed-DPI desktop, so ask Windows
+            # for the native cursor location instead.
+            global_pos = POINT()
+            if not user32.GetCursorPos(ctypes.byref(global_pos)):
+                fallback = event.globalPos()
+                global_pos.x, global_pos.y = fallback.x(), fallback.y()
+            self._host_window._show_system_menu(
+                self._host_window._hwnd(), int(global_pos.x), int(global_pos.y)
+            )
+            event.accept()
+            return
+        super().contextMenuEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton and not self._over_caption_button(event.position().toPoint()):
+            self._reset_drag_state()
             self._host_window.toggleMaximized()
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
+
+    def _reset_drag_state(self) -> None:
+        self._drag_press_global = None
+        self._drag_press_local = None
+        self._drag_was_maximized = False
+        self._system_move_started = False
 
     def _over_caption_button(self, pos: QPoint) -> bool:
         if IS_MACOS:
@@ -358,7 +497,7 @@ class FramelessMainWindow(QMainWindow):
     Windows:
       - Native 8-way resizing, move, Aero Snap and Win+Arrow
       - Windows 11 maximize-button Snap Layout flyout via HTMAXBUTTON
-      - Native system menu (title-bar right click and app-icon interactions)
+      - System menu on title-bar right click
       - DWM shadow, rounded corners, active/inactive chrome
       - Correct taskbar-aware maximize and per-monitor DPI-aware hit testing
       - Optional Win11 Mica/Mica Alt/system backdrop API
@@ -379,6 +518,17 @@ class FramelessMainWindow(QMainWindow):
         super().__init__(parent)
         self._dark_mode = True
         self._backdrop_type = 0
+        self._title_bar_color: QColor | None = None
+        self._inactive_title_bar_color: QColor | None = None
+        self._max_button_pressed = False
+        self._saved_normal_geometry: QRect | None = None
+        # Qt's reported maximized state can briefly disagree with Explorer
+        # after a maximized window is minimized and restored from the taskbar.
+        # Keep the chrome state independently so the custom button stays a
+        # restore button for that round trip.
+        self._chrome_maximized = False
+        self._minimized_from_maximized = False
+        self._screen_change_refresh_pending = False
         self.setWindowTitle("Frameless PyQt6 Window")
         self.resize(1100, 700)
         self.setMinimumSize(330, 200)
@@ -428,6 +578,7 @@ class FramelessMainWindow(QMainWindow):
         self.winId()  # Ensure native handle exists.
         if IS_WINDOWS:
             self._configure_native_window()
+            self._connect_windows_screen_changed()
         elif IS_MACOS:
             _configure_macos_nswindow(self)
 
@@ -447,6 +598,35 @@ class FramelessMainWindow(QMainWindow):
         self._apply_palette()
         if IS_WINDOWS and int(self.winId()):
             self._apply_windows_dwm_options()
+
+    def setTitleBarColor(
+        self, color: QColor | str, inactive_color: QColor | str | None = None
+    ) -> None:
+        """Set the active title-bar color.
+
+        ``color`` accepts any QColor-supported name or CSS-style color, such
+        as ``"#2563eb"`` or ``"steelblue"``. Supply ``inactive_color`` to
+        explicitly control the inactive-window color; otherwise a slightly
+        darker shade of the active color is used.
+        """
+        self._title_bar_color = self._coerce_color(color, "color")
+        self._inactive_title_bar_color = (
+            self._coerce_color(inactive_color, "inactive_color")
+            if inactive_color is not None
+            else None
+        )
+        self._apply_palette()
+
+    def resetTitleBarColor(self) -> None:
+        """Restore the title-bar colors selected by :meth:`setDarkMode`."""
+        self._title_bar_color = None
+        self._inactive_title_bar_color = None
+        self._apply_palette()
+
+    def titleBarColor(self) -> QColor:
+        """Return the effective active title-bar color."""
+        active, _ = self._effective_title_bar_colors()
+        return QColor(active)
 
     def setMicaEnabled(self, enabled: bool = True) -> None:
         """Enable Win11 Mica backdrop where supported; no-op elsewhere.
@@ -478,10 +658,33 @@ class FramelessMainWindow(QMainWindow):
         self._apply_windows_dwm_options()
 
     def toggleMaximized(self) -> None:
-        if self.isMaximized():
-            self.showNormal()
+        if self._is_chrome_maximized():
+            self._restore_normal_geometry()
         else:
             self.showMaximized()
+
+    def showMaximized(self) -> None:
+        """Maximize while retaining the exact pre-maximize Qt geometry."""
+        if not self._is_chrome_maximized() and not self.isMinimized():
+            geometry = self.geometry()
+            if geometry.isValid():
+                self._saved_normal_geometry = QRect(geometry)
+        self._chrome_maximized = True
+        self._minimized_from_maximized = False
+        super().showMaximized()
+        self._sync_maximize_button(True)
+
+    def showMinimized(self) -> None:
+        """Minimize while remembering whether taskbar restore should be maximized."""
+        self._minimized_from_maximized = self._is_chrome_maximized()
+        super().showMinimized()
+
+    def showNormal(self) -> None:
+        """Explicitly restore to the normal window state."""
+        self._chrome_maximized = False
+        self._minimized_from_maximized = False
+        super().showNormal()
+        self._sync_maximize_button(False)
 
     def titleBar(self) -> CustomTitleBar:
         return self.title_bar
@@ -489,32 +692,120 @@ class FramelessMainWindow(QMainWindow):
     def contentWidget(self) -> QWidget:
         return self.content
 
+    def _is_chrome_maximized(self, hwnd_value: int | None = None) -> bool:
+        """Return the actual maximize state used for caption behavior."""
+        if self._chrome_maximized:
+            return True
+        if self.isMaximized():
+            return True
+        if IS_WINDOWS:
+            # Native-event callers provide MSG.hwnd so this check never tries
+            # to create a native handle while Windows is already dispatching a
+            # message for that handle.
+            hwnd = hwnd_value if hwnd_value is not None else int(self.winId())
+            if hwnd:
+                return bool(user32.IsZoomed(wintypes.HWND(hwnd)))
+        return False
+
+    def _normal_geometry_for_restore(self) -> QRect:
+        """Return the normal bounds remembered before the current maximize."""
+        if self._saved_normal_geometry is not None and self._saved_normal_geometry.isValid():
+            return QRect(self._saved_normal_geometry)
+        geometry = self.normalGeometry()
+        return QRect(geometry if geometry.isValid() else self.geometry())
+
+    def _restore_normal_geometry(self, top_left: QPoint | None = None) -> None:
+        """Leave maximized state and restore the saved normal bounds exactly."""
+        geometry = self._normal_geometry_for_restore()
+        self._chrome_maximized = False
+        self._minimized_from_maximized = False
+        super().showNormal()
+        if geometry.isValid():
+            if top_left is not None:
+                geometry.moveTopLeft(top_left)
+            self.setGeometry(geometry)
+        # WindowState can still briefly say "maximized" after showNormal().
+        # The custom command has already restored the normal geometry, so set
+        # the glyph explicitly instead of waiting for a later activation event.
+        self._sync_maximize_button(False)
+
+    def _sync_maximize_button(self, maximized: bool | None = None) -> None:
+        """Immediately repaint the custom maximize/restore glyph."""
+        if not hasattr(self, "title_bar"):
+            return
+        if maximized is None:
+            maximized = self._is_chrome_maximized()
+        button = self.title_bar.max_button
+        button.kind = "restore" if maximized else "max"
+        button.update()
+
     # ----------------------------- Qt events ------------------------------
+    @staticmethod
+    def _coerce_color(color: QColor | str, parameter: str) -> QColor:
+        converted = QColor(color)
+        if not converted.isValid():
+            raise ValueError(f"{parameter} must be a valid QColor or color name")
+        return converted
+
+    @staticmethod
+    def _color_to_css(color: QColor) -> str:
+        return f"rgba({color.red()},{color.green()},{color.blue()},{color.alpha()})"
+
+    @staticmethod
+    def _title_bar_uses_dark_chrome(color: QColor) -> bool:
+        """Choose white glyphs for backgrounds with low relative luminance."""
+        def linear(channel: int) -> float:
+            value = channel / 255.0
+            return value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
+
+        luminance = (
+            0.2126 * linear(color.red())
+            + 0.7152 * linear(color.green())
+            + 0.0722 * linear(color.blue())
+        )
+        return luminance < 0.42
+
+    def _effective_title_bar_colors(self) -> tuple[QColor, QColor]:
+        if self._title_bar_color is None:
+            if self._dark_mode:
+                return QColor(45, 45, 48), QColor(39, 39, 41)
+            return QColor(243, 243, 243), QColor(238, 238, 238)
+
+        active = QColor(self._title_bar_color)
+        inactive = (
+            QColor(self._inactive_title_bar_color)
+            if self._inactive_title_bar_color is not None
+            else active.darker(115)
+        )
+        return active, inactive
+
     def _apply_palette(self) -> None:
         if not hasattr(self, "root"):
             return
+        active_title_bar, inactive_title_bar = self._effective_title_bar_colors()
+        title_bar_style = (
+            f"#customTitleBar{{background:{self._color_to_css(active_title_bar)};}}"
+            f"#customTitleBar[activeWindow=\"false\"]{{background:{self._color_to_css(inactive_title_bar)};}}"
+        )
         if self._dark_mode:
             self.setStyleSheet(
                 "#windowRoot{background:rgb(32,32,32);}"
-                "#customTitleBar{background:rgb(45,45,48);}"
-                "#customTitleBar[activeWindow=\"false\"]{background:rgb(39,39,41);}"
-                "QLabel{color:rgb(230,230,230);}"
+                + title_bar_style
+                + "QLabel{color:rgb(230,230,230);}"
             )
         else:
             self.setStyleSheet(
                 "#windowRoot{background:rgb(248,248,248);}"
-                "#customTitleBar{background:rgb(243,243,243);}"
-                "#customTitleBar[activeWindow=\"false\"]{background:rgb(238,238,238);}"
-                "QLabel{color:rgb(30,30,30);}"
+                + title_bar_style
+                + "QLabel{color:rgb(30,30,30);}"
             )
         if hasattr(self, "title_bar"):
-            self.title_bar.setDarkMode(self._dark_mode)
+            self.title_bar.setDarkMode(self._title_bar_uses_dark_chrome(active_title_bar))
 
     def changeEvent(self, event):
         super().changeEvent(event)
         if hasattr(self, "title_bar"):
-            self.title_bar.max_button.kind = "restore" if self.isMaximized() else "max"
-            self.title_bar.max_button.update()
+            self._sync_maximize_button()
             self.title_bar.setActive(self.isActiveWindow())
 
     def focusInEvent(self, event):
@@ -535,31 +826,73 @@ class FramelessMainWindow(QMainWindow):
         def _configure_native_window(self) -> None:
             hwnd = self._hwnd()
             style = user32.GetWindowLongPtrW(hwnd, GWL_STYLE)
-            style |= WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU
+            # Remove only the native visual caption. The system-menu and
+            # minimize/maximize capability bits let Explorer treat this as a
+            # normal taskbar window (including click-to-minimize/restore), but
+            # without WS_CAPTION they do not paint a second caption button set.
+            style &= ~WS_CAPTION
+            style |= WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX
             user32.SetWindowLongPtrW(hwnd, GWL_STYLE, style)
+            self._refresh_windows_nonclient_frame(hwnd)
+
+        def _connect_windows_screen_changed(self) -> None:
+            """Refresh native chrome when Qt moves the HWND to another screen."""
+            handle = self.windowHandle()
+            if handle is not None:
+                handle.screenChanged.connect(self._on_windows_screen_changed)
+
+        def _on_windows_screen_changed(self, _screen=None) -> None:
+            # Let Qt complete its DPI/screen transition first.  Coalescing also
+            # avoids redundant DWM calls when a move crosses monitor boundaries.
+            if self._screen_change_refresh_pending:
+                return
+            self._screen_change_refresh_pending = True
+            QTimer.singleShot(0, self._refresh_windows_nonclient_frame)
+
+        def _refresh_windows_nonclient_frame(self, hwnd_value: int | None = None) -> None:
+            """Re-read non-client style and DWM state without changing the window."""
+            self._screen_change_refresh_pending = False
+            hwnd_number = hwnd_value if hwnd_value is not None else self._hwnd()
+            if not hwnd_number:
+                return
             # Tell Windows to re-read the modified non-client style immediately.
-            # Without SWP_FRAMECHANGED, the added system-menu and resize styles
-            # can remain stale until a later unrelated geometry change.
+            # Without SWP_FRAMECHANGED, stale caption buttons can remain visible
+            # until a later unrelated geometry change.
             user32.SetWindowPos(
-                wintypes.HWND(hwnd), None, 0, 0, 0, 0,
+                wintypes.HWND(hwnd_number), None, 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
             )
-            self._apply_windows_dwm_options()
+            self._apply_windows_dwm_options(hwnd_number)
 
         def _apply_windows_dwm_options(self, hwnd_value: int | None = None) -> None:
+            # DWM is present on supported Qt Windows versions, but individual
+            # attributes vary by Windows build and composition/backend. Keep
+            # appearance enhancements best-effort so software rendering or an
+            # older compositor cannot prevent the window from starting.
             hwnd = wintypes.HWND(hwnd_value if hwnd_value is not None else self._hwnd())
+            def set_attribute(attribute: int, value) -> None:
+                try:
+                    dwmapi.DwmSetWindowAttribute(
+                        hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value)
+                    )
+                except (AttributeError, OSError):
+                    pass
+
             corner = ctypes.c_int(DWMWCP_ROUND)
-            dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
-                                         ctypes.byref(corner), ctypes.sizeof(corner))
+            set_attribute(DWMWA_WINDOW_CORNER_PREFERENCE, corner)
+            # WS_THICKFRAME is necessary for native resize behavior, but on
+            # Windows 11 DWM can draw a visible one-pixel frame around this
+            # otherwise frameless window (especially noticeable while maximized).
+            # Hide that DWM border consistently; unsupported builds report an
+            # HRESULT and keep their normal appearance.
+            border_color = ctypes.c_uint(DWMWA_COLOR_NONE)
+            set_attribute(DWMWA_BORDER_COLOR, border_color)
             dark = wintypes.BOOL(self._dark_mode)
-            dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
-                                         ctypes.byref(dark), ctypes.sizeof(dark))
+            set_attribute(DWMWA_USE_IMMERSIVE_DARK_MODE, dark)
             backdrop = ctypes.c_int(self._backdrop_type)
             # Attribute 38 is supported on modern Windows 11. An unsupported
-            # build reports an HRESULT; it does not raise a Python exception.
-            # Ignoring that result deliberately leaves the normal DWM backdrop.
-            dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE,
-                                         ctypes.byref(backdrop), ctypes.sizeof(backdrop))
+            # build reports an HRESULT; ignoring it leaves the normal backdrop.
+            set_attribute(DWMWA_SYSTEMBACKDROP_TYPE, backdrop)
 
         @staticmethod
         def _screen_to_client_native(hwnd: int, x: int, y: int) -> tuple[int, int]:
@@ -596,15 +929,19 @@ class FramelessMainWindow(QMainWindow):
             if inside(self._native_rect(tb.icon, dpr)):
                 return HTSYSMENU
             if inside(self._native_rect(tb.close_button, dpr)):
-                return HTCLOSE
+                return HTCLIENT
             if inside(self._native_rect(tb.max_button, dpr)):
                 return HTMAXBUTTON  # Required for Windows 11 Snap Layout hover.
             if inside(self._native_rect(tb.min_button, dpr)):
-                return HTMINBUTTON
-            return HTCAPTION
+                return HTCLIENT
+            # The remaining title bar is a Qt client region. CustomTitleBar
+            # starts QWindow.startSystemMove() from its mouse press event.
+            return HTCLIENT
 
-        def _resize_hit_test(self, x: int, y: int, dpr: float) -> int | None:
-            if self.isMaximized() or self.isFullScreen():
+        def _resize_hit_test(
+            self, x: int, y: int, dpr: float, hwnd_value: int | None = None
+        ) -> int | None:
+            if self._is_chrome_maximized(hwnd_value) or self.isFullScreen():
                 return None
             border = max(5, round(self.RESIZE_BORDER * dpr))
             w, h = round(self.width() * dpr), round(self.height() * dpr)
@@ -630,6 +967,7 @@ class FramelessMainWindow(QMainWindow):
             if not user32.GetMonitorInfoW(monitor, ctypes.byref(mi)):
                 return
             work, mon = mi.rcWork, mi.rcMonitor
+            work = self._work_area_with_auto_hide_taskbar_inset(work, mon)
             mmi.ptMaxPosition.x = work.left - mon.left
             mmi.ptMaxPosition.y = work.top - mon.top
             mmi.ptMaxSize.x = work.right - work.left
@@ -638,6 +976,94 @@ class FramelessMainWindow(QMainWindow):
             minimum = self.minimumSize()
             mmi.ptMinTrackSize.x = max(mmi.ptMinTrackSize.x, round(minimum.width() * dpr))
             mmi.ptMinTrackSize.y = max(mmi.ptMinTrackSize.y, round(minimum.height() * dpr))
+
+        @classmethod
+        def _work_area_with_auto_hide_taskbar_inset(
+            cls, work_area: RECT, monitor_rect: RECT
+        ) -> RECT:
+            work = RECT(work_area.left, work_area.top, work_area.right, work_area.bottom)
+            edge = cls._auto_hide_taskbar_edge(monitor_rect)
+            if edge == ABE_LEFT:
+                work.left += AUTO_HIDE_TASKBAR_INSET
+            elif edge == ABE_TOP:
+                work.top += AUTO_HIDE_TASKBAR_INSET
+            elif edge == ABE_RIGHT:
+                work.right -= AUTO_HIDE_TASKBAR_INSET
+            elif edge == ABE_BOTTOM:
+                work.bottom -= AUTO_HIDE_TASKBAR_INSET
+            return work
+
+        @staticmethod
+        def _auto_hide_taskbar_edge(monitor_rect: RECT) -> int | None:
+            """Return this monitor's auto-hide taskbar edge, if it has one.
+
+            ``ABM_GETAUTOHIDEBAREX`` is per-monitor.  Its rectangles are native
+            physical pixels, matching ``WM_GETMINMAXINFO`` exactly, so no Qt DPR
+            conversion is needed here.
+            """
+            for edge in (ABE_LEFT, ABE_TOP, ABE_RIGHT, ABE_BOTTOM):
+                appbar = APPBARDATA()
+                appbar.cbSize = ctypes.sizeof(APPBARDATA)
+                appbar.uEdge = edge
+                appbar.rc = RECT(
+                    monitor_rect.left, monitor_rect.top,
+                    monitor_rect.right, monitor_rect.bottom,
+                )
+                if shell32.SHAppBarMessage(ABM_GETAUTOHIDEBAREX, ctypes.byref(appbar)):
+                    return edge
+            return None
+
+        def _set_max_button_pressed(self, pressed: bool) -> None:
+            self._max_button_pressed = pressed
+            self.title_bar.max_button.setDown(pressed)
+
+        def _max_button_contains_native_point(self, x: int, y: int, dpr: float) -> bool:
+            left, top, right, bottom = self._native_rect(self.title_bar.max_button, dpr)
+            return left <= x < right and top <= y < bottom
+
+        def _begin_max_button_press(
+            self, hwnd_value: int, screen_x: int, screen_y: int
+        ) -> bool:
+            x, y = self._screen_to_client_native(hwnd_value, screen_x, screen_y)
+            dpr = self._window_dpr(hwnd_value)
+            if not self._max_button_contains_native_point(x, y, dpr):
+                return False
+            self._set_max_button_pressed(True)
+            user32.SetCapture(wintypes.HWND(hwnd_value))
+            return True
+
+        def _clear_max_button_press(self, hwnd_value: int) -> None:
+            self._set_max_button_pressed(False)
+            if int(user32.GetCapture() or 0) == hwnd_value:
+                user32.ReleaseCapture()
+
+        def _finish_max_button_press(
+            self, hwnd_value: int, x: int, y: int, dpr: float
+        ) -> None:
+            should_toggle = (
+                self._max_button_pressed
+                and self._max_button_contains_native_point(x, y, dpr)
+            )
+            self._clear_max_button_press(hwnd_value)
+            if should_toggle:
+                # A taskbar restore can still be completing while the first
+                # non-client button-up arrives. Queue the transition so Qt and
+                # the native HWND agree on the pre-click maximize state.
+                QTimer.singleShot(0, self.toggleMaximized)
+
+        def _set_max_button_native_hover(self, hovered: bool) -> None:
+            self.title_bar.max_button.setNativeHover(hovered)
+
+        @staticmethod
+        def _track_nonclient_mouse_leave(hwnd_value: int) -> None:
+            # WM_NCMOUSELEAVE is only guaranteed after explicitly registering
+            # a non-client leave tracker. This prevents the custom hover color
+            # from getting stuck when the pointer exits the window directly.
+            tracker = TRACKMOUSEEVENT()
+            tracker.cbSize = ctypes.sizeof(TRACKMOUSEEVENT)
+            tracker.dwFlags = TME_LEAVE | TME_NONCLIENT
+            tracker.hwndTrack = wintypes.HWND(hwnd_value)
+            user32.TrackMouseEvent(ctypes.byref(tracker))
 
         @staticmethod
         def _show_system_menu(hwnd_value: int, screen_x: int, screen_y: int) -> None:
@@ -653,7 +1079,97 @@ class FramelessMainWindow(QMainWindow):
         def nativeEvent(self, eventType, message):
             msg = ctypes.cast(int(message), ctypes.POINTER(MSG)).contents
 
+            if msg.message == WM_SYSCOMMAND:
+                command = int(msg.wParam) & 0xFFF0
+                if command == SC_MINIMIZE:
+                    self._minimized_from_maximized = self._is_chrome_maximized(
+                        int(msg.hwnd)
+                    )
+                elif command == SC_MAXIMIZE:
+                    self._chrome_maximized = True
+                    self._minimized_from_maximized = False
+                elif command == SC_RESTORE:
+                    # Explorer's taskbar restore can arrive before Qt updates
+                    # WindowState. Preserve the preceding maximize state so
+                    # the custom button restores the saved normal geometry.
+                    self._chrome_maximized = self._minimized_from_maximized
+                    self._minimized_from_maximized = False
+                self._sync_maximize_button(self._chrome_maximized)
+
+            if msg.message == WM_NCACTIVATE:
+                # WS_THICKFRAME is retained for native edge-resize behavior, but
+                # Windows otherwise repaints that invisible non-client frame on
+                # activation. A -1 lParam preserves normal activation while
+                # explicitly telling DefWindowProc not to repaint it.
+                result = user32.DefWindowProcW(
+                    wintypes.HWND(int(msg.hwnd)),
+                    wintypes.UINT(msg.message),
+                    wintypes.WPARAM(int(msg.wParam)),
+                    wintypes.LPARAM(-1),
+                )
+                return True, int(result)
+
             if msg.message == WM_NCCALCSIZE:
+                return True, 0
+
+            if msg.message == WM_NCMOUSEMOVE:
+                # The maximize region is deliberately non-client so Windows 11
+                # can offer Snap Layouts. Qt therefore never receives a normal
+                # QPushButton hover event for it; mirror that state explicitly
+                # while leaving the native message unhandled for the shell.
+                if int(msg.wParam) == HTMAXBUTTON:
+                    self._track_nonclient_mouse_leave(int(msg.hwnd))
+                    self._set_max_button_native_hover(True)
+                else:
+                    self._set_max_button_native_hover(False)
+                return False, 0
+
+            if msg.message == WM_MOUSEMOVE and self.title_bar.max_button.native_hovered:
+                x = _signed_word(int(msg.lParam))
+                y = _signed_word(int(msg.lParam) >> 16)
+                self._set_max_button_native_hover(
+                    self._max_button_contains_native_point(
+                        x, y, self._window_dpr(int(msg.hwnd))
+                    )
+                )
+                return False, 0
+
+            if msg.message in (WM_NCMOUSELEAVE, WM_MOUSELEAVE):
+                self._set_max_button_native_hover(False)
+                return False, 0
+
+            if (
+                msg.message in (WM_NCLBUTTONDOWN, WM_NCLBUTTONDBLCLK)
+                and int(msg.wParam) == HTMAXBUTTON
+            ):
+                # HTMAXBUTTON is necessary for the Windows 11 Snap Layout hover,
+                # but the default non-client click handler would also paint and
+                # track a second native maximize button. Keep the hit-test result
+                # for Snap and capture the click for the custom button instead.
+                screen_x = _signed_word(int(msg.lParam))
+                screen_y = _signed_word(int(msg.lParam) >> 16)
+                if self._begin_max_button_press(int(msg.hwnd), screen_x, screen_y):
+                    return True, 0
+
+            if msg.message == WM_NCLBUTTONUP and self._max_button_pressed:
+                screen_x = _signed_word(int(msg.lParam))
+                screen_y = _signed_word(int(msg.lParam) >> 16)
+                x, y = self._screen_to_client_native(int(msg.hwnd), screen_x, screen_y)
+                self._finish_max_button_press(
+                    int(msg.hwnd), x, y, self._window_dpr(int(msg.hwnd))
+                )
+                return True, 0
+
+            if msg.message == WM_LBUTTONUP and self._max_button_pressed:
+                x = _signed_word(int(msg.lParam))
+                y = _signed_word(int(msg.lParam) >> 16)
+                self._finish_max_button_press(
+                    int(msg.hwnd), x, y, self._window_dpr(int(msg.hwnd))
+                )
+                return True, 0
+
+            if msg.message in (WM_CANCELMODE, WM_CAPTURECHANGED) and self._max_button_pressed:
+                self._clear_max_button_press(int(msg.hwnd))
                 return True, 0
 
             if msg.message == WM_GETMINMAXINFO:
@@ -661,20 +1177,11 @@ class FramelessMainWindow(QMainWindow):
                 return True, 0
 
             if msg.message == WM_NCHITTEST:
-                # DWM gets the first opportunity to identify any non-client
-                # regions it owns. This is required for custom frames on Vista+
-                # and keeps future DWM behavior from being shadowed by our hit
-                # testing.
-                dwm_result = ctypes.c_ssize_t()
-                if dwmapi.DwmDefWindowProc(
-                    msg.hwnd, msg.message, msg.wParam, msg.lParam, ctypes.byref(dwm_result)
-                ):
-                    return True, int(dwm_result.value)
                 screen_x = _signed_word(int(msg.lParam))
                 screen_y = _signed_word(int(msg.lParam) >> 16)
                 x, y = self._screen_to_client_native(int(msg.hwnd), screen_x, screen_y)
                 dpr = self._window_dpr(int(msg.hwnd))
-                resize = self._resize_hit_test(x, y, dpr)
+                resize = self._resize_hit_test(x, y, dpr, int(msg.hwnd))
                 if resize is not None:
                     return True, resize
                 caption = self._caption_hit_test(x, y, dpr)
