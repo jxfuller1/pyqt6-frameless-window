@@ -13,6 +13,8 @@ if sys.platform != "win32":
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6 import sip
+from PyQt6.QtCore import QEvent, QPoint, QPointF, Qt
+from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtWidgets import QApplication, QWidget
 
 import frameless_mainwindow as fw
@@ -74,12 +76,12 @@ class FramelessMainWindowTests(unittest.TestCase):
             self.window.setTitleBarColor("not a color")
 
     @unittest.skipUnless(IS_WINDOWS, "Windows-only native hit test")
-    def test_windows_caption_hit_test_uses_title_bar_geometry(self) -> None:
+    def test_windows_title_bar_hit_test_uses_client_geometry(self) -> None:
         dpr = self.window._window_dpr()
         left, top, right, bottom = self.window._native_rect(self.window.titleBar().title, dpr)
         self.assertEqual(
             self.window._caption_hit_test((left + right) // 2, (top + bottom) // 2, dpr),
-            fw.HTCAPTION,
+            fw.HTCLIENT,
         )
 
     @unittest.skipUnless(IS_WINDOWS, "Windows-only custom caption controls")
@@ -160,6 +162,141 @@ class FramelessMainWindowTests(unittest.TestCase):
         self.assertEqual(int(fw.user32.GetCapture() or 0), 0)
         self.assertTrue(self.window.isMaximized())
 
+    @unittest.skipUnless(IS_WINDOWS, "Windows-only maximize hover")
+    def test_windows_maximize_hover_is_mirrored_to_custom_button(self) -> None:
+        message = fw.MSG()
+        message.hwnd = self.window._hwnd()
+        message.message = fw.WM_NCMOUSEMOVE
+        message.wParam = fw.HTMAXBUTTON
+        self.assertEqual(
+            self.window.nativeEvent(
+                b"windows_generic_MSG", sip.voidptr(ctypes.addressof(message))
+            ),
+            (False, 0),
+        )
+        button = self.window.titleBar().max_button
+        self.assertTrue(button.native_hovered)
+        self.assertTrue(button.property("nativeHover"))
+        self.assertGreater(button.grab().toImage().pixelColor(2, 2).alpha(), 0)
+
+        message.message = fw.WM_NCMOUSELEAVE
+        self.assertEqual(
+            self.window.nativeEvent(
+                b"windows_generic_MSG", sip.voidptr(ctypes.addressof(message))
+            ),
+            (False, 0),
+        )
+        self.assertFalse(button.native_hovered)
+
+    @unittest.skipUnless(IS_WINDOWS, "Windows-only taskbar restore behavior")
+    def test_windows_maximize_click_restores_after_taskbar_restore(self) -> None:
+        normal_geometry = self.window.geometry()
+        hwnd = self.window._hwnd()
+        self.window.showMaximized()
+        self.app.processEvents()
+        self.window.showMinimized()
+        self.app.processEvents()
+
+        show_window = fw.user32.ShowWindow
+        show_window.restype = fw.wintypes.BOOL
+        show_window.argtypes = (fw.wintypes.HWND, ctypes.c_int)
+        show_window(fw.wintypes.HWND(hwnd), 9)  # SW_RESTORE, as taskbar activation does.
+        self.app.processEvents()
+        self.assertTrue(self.window._is_chrome_maximized())
+
+        dpr = self.window._window_dpr(hwnd)
+        left, top, right, bottom = self.window._native_rect(
+            self.window.titleBar().max_button, dpr
+        )
+        client_x, client_y = (left + right) // 2, (top + bottom) // 2
+        screen_point = fw.POINT(client_x, client_y)
+        client_to_screen = fw.user32.ClientToScreen
+        client_to_screen.restype = fw.wintypes.BOOL
+        client_to_screen.argtypes = (fw.wintypes.HWND, ctypes.POINTER(fw.POINT))
+        self.assertTrue(
+            client_to_screen(fw.wintypes.HWND(hwnd), ctypes.byref(screen_point))
+        )
+
+        down = fw.MSG()
+        down.hwnd = hwnd
+        down.message = fw.WM_NCLBUTTONDOWN
+        down.wParam = fw.HTMAXBUTTON
+        down.lParam = (screen_point.x & 0xFFFF) | ((screen_point.y & 0xFFFF) << 16)
+        self.assertEqual(
+            self.window.nativeEvent(
+                b"windows_generic_MSG", sip.voidptr(ctypes.addressof(down))
+            ),
+            (True, 0),
+        )
+
+        up = fw.MSG()
+        up.hwnd = hwnd
+        up.message = fw.WM_LBUTTONUP
+        up.lParam = (client_x & 0xFFFF) | ((client_y & 0xFFFF) << 16)
+        self.assertEqual(
+            self.window.nativeEvent(
+                b"windows_generic_MSG", sip.voidptr(ctypes.addressof(up))
+            ),
+            (True, 0),
+        )
+        self.app.processEvents()
+        self.assertFalse(self.window._is_chrome_maximized())
+        self.assertEqual(self.window.geometry(), normal_geometry)
+
+        dpr = self.window._window_dpr(hwnd)
+        native_mid_y = round(self.window.height() * dpr / 2)
+        self.assertEqual(self.window._resize_hit_test(0, native_mid_y, dpr), fw.HTLEFT)
+
+    @unittest.skipUnless(IS_WINDOWS, "Windows-only drag from maximized title bar")
+    def test_windows_dragging_maximized_title_bar_restores_and_enables_resize(self) -> None:
+        normal_geometry = self.window.geometry()
+        self.window.showMaximized()
+        self.app.processEvents()
+
+        title_bar = self.window.titleBar()
+        press_local = QPoint(min(400, title_bar.width() // 2), title_bar.height() // 2)
+        press_global = title_bar.mapToGlobal(press_local)
+        press = QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            QPointF(press_local),
+            QPointF(press_global),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        title_bar.mousePressEvent(press)
+
+        distance = QApplication.startDragDistance() + 1
+        move_local = press_local + QPoint(distance, 0)
+        move_global = press_global + QPoint(distance, 0)
+        move = QMouseEvent(
+            QEvent.Type.MouseMove,
+            QPointF(move_local),
+            QPointF(move_global),
+            Qt.MouseButton.NoButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        title_bar.mouseMoveEvent(move)
+        self.app.processEvents()
+
+        self.assertFalse(self.window._is_chrome_maximized())
+        self.assertEqual(self.window.size(), normal_geometry.size())
+        self.assertTrue(title_bar._system_move_started)
+        dpr = self.window._window_dpr(self.window._hwnd())
+        native_mid_y = round(self.window.height() * dpr / 2)
+        self.assertEqual(self.window._resize_hit_test(0, native_mid_y, dpr), fw.HTLEFT)
+
+        release = QMouseEvent(
+            QEvent.Type.MouseButtonRelease,
+            QPointF(move_local),
+            QPointF(move_global),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        title_bar.mouseReleaseEvent(release)
+
     @unittest.skipUnless(IS_WINDOWS, "Windows-only native messages")
     def test_windows_unhandled_messages_and_caption_hit_are_safe(self) -> None:
         generic = fw.MSG()
@@ -187,13 +324,23 @@ class FramelessMainWindowTests(unittest.TestCase):
         hit_result = self.window.nativeEvent(
             b"windows_generic_MSG", sip.voidptr(ctypes.addressof(hit))
         )
-        self.assertEqual(hit_result, (True, fw.HTCAPTION))
+        self.assertEqual(hit_result, (True, fw.HTCLIENT))
 
     @unittest.skipUnless(IS_WINDOWS, "Windows-only taskbar-aware maximize")
     def test_windows_maximize_uses_the_screen_work_area(self) -> None:
         self.window.showMaximized()
         self.app.processEvents()
         self.assertEqual(self.window.geometry(), self.window.screen().availableGeometry())
+
+    @unittest.skipUnless(IS_WINDOWS, "Windows-only DWM border behavior")
+    def test_windows_maximized_window_does_not_show_a_dwm_border_gap(self) -> None:
+        self.window.showMaximized()
+        self.app.processEvents()
+        image = self.window.screen().grabWindow(self.window._hwnd()).toImage()
+        self.assertEqual(
+            image.pixelColor(0, 0).getRgb(),
+            self.window.titleBarColor().getRgb(),
+        )
 
     @unittest.skipUnless(IS_WINDOWS, "Windows-only non-client activation behavior")
     def test_windows_activation_does_not_paint_a_native_frame(self) -> None:

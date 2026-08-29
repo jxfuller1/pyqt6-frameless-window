@@ -4,7 +4,7 @@ import ctypes
 import sys
 from ctypes import wintypes
 
-from PyQt6.QtCore import QPoint, Qt
+from PyQt6.QtCore import QPoint, QTimer, Qt
 from PyQt6.QtGui import QColor, QFont, QIcon, QMouseEvent, QPainter, QPen
 from PyQt6.QtWidgets import QApplication, QLabel, QMainWindow, QPushButton, QStyle, QVBoxLayout, QWidget
 
@@ -25,9 +25,13 @@ if IS_WINDOWS:
     WM_NCLBUTTONUP = 0x00A2
     WM_NCLBUTTONDBLCLK = 0x00A3
     WM_NCRBUTTONUP = 0x00A5
+    WM_NCMOUSEMOVE = 0x00A0
     WM_LBUTTONUP = 0x0202
+    WM_MOUSEMOVE = 0x0200
     WM_CANCELMODE = 0x001F
     WM_CAPTURECHANGED = 0x0215
+    WM_NCMOUSELEAVE = 0x02A2
+    WM_MOUSELEAVE = 0x02A3
     WM_DPICHANGED = 0x02E0
     WM_SYSCOMMAND = 0x0112
 
@@ -56,6 +60,8 @@ if IS_WINDOWS:
     MONITOR_DEFAULTTONEAREST = 2
     TPM_RETURNCMD = 0x0100
     TPM_RIGHTBUTTON = 0x0002
+    TME_LEAVE = 0x00000002
+    TME_NONCLIENT = 0x00000010
     SWP_NOSIZE = 0x0001
     SWP_NOMOVE = 0x0002
     SWP_NOZORDER = 0x0004
@@ -64,7 +70,9 @@ if IS_WINDOWS:
 
     DWMWA_USE_IMMERSIVE_DARK_MODE = 20
     DWMWA_WINDOW_CORNER_PREFERENCE = 33
+    DWMWA_BORDER_COLOR = 34
     DWMWA_SYSTEMBACKDROP_TYPE = 38
+    DWMWA_COLOR_NONE = 0xFFFFFFFE
     DWMWCP_DEFAULT = 0
     DWMWCP_ROUND = 2
     DWMSBT_AUTO = 0
@@ -85,6 +93,10 @@ if IS_WINDOWS:
                     ("wParam", wintypes.WPARAM), ("lParam", wintypes.LPARAM),
                     ("time", wintypes.DWORD), ("pt", POINT), ("lPrivate", wintypes.DWORD)]
 
+    class TRACKMOUSEEVENT(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                    ("hwndTrack", wintypes.HWND), ("dwHoverTime", wintypes.DWORD)]
+
     class MINMAXINFO(ctypes.Structure):
         _fields_ = [("ptReserved", POINT), ("ptMaxSize", POINT),
                     ("ptMaxPosition", POINT), ("ptMinTrackSize", POINT),
@@ -104,6 +116,10 @@ if IS_WINDOWS:
     user32.GetMonitorInfoW.argtypes = (wintypes.HMONITOR, ctypes.POINTER(MONITORINFO))
     user32.ScreenToClient.restype = wintypes.BOOL
     user32.ScreenToClient.argtypes = (wintypes.HWND, ctypes.POINTER(POINT))
+    user32.GetCursorPos.restype = wintypes.BOOL
+    user32.GetCursorPos.argtypes = (ctypes.POINTER(POINT),)
+    user32.TrackMouseEvent.restype = wintypes.BOOL
+    user32.TrackMouseEvent.argtypes = (ctypes.POINTER(TRACKMOUSEEVENT),)
     user32.GetSystemMenu.restype = wintypes.HMENU
     user32.GetSystemMenu.argtypes = (wintypes.HWND, wintypes.BOOL)
     user32.TrackPopupMenu.restype = wintypes.UINT
@@ -122,6 +138,8 @@ if IS_WINDOWS:
     user32.GetCapture.argtypes = ()
     user32.ReleaseCapture.restype = wintypes.BOOL
     user32.ReleaseCapture.argtypes = ()
+    user32.IsZoomed.restype = wintypes.BOOL
+    user32.IsZoomed.argtypes = (wintypes.HWND,)
     user32.DefWindowProcW.restype = ctypes.c_ssize_t
     user32.DefWindowProcW.argtypes = (
         wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
@@ -202,6 +220,7 @@ class CaptionButton(QPushButton):
         self.kind = kind
         self.active = True
         self.dark_mode = True
+        self.native_hovered = False
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setCursor(Qt.CursorShape.ArrowCursor)
         self.setFixedWidth(46)
@@ -218,6 +237,17 @@ class CaptionButton(QPushButton):
         self._apply_style()
         self.update()
 
+    def setNativeHover(self, hovered: bool) -> None:
+        """Mirror a native non-client hover state in the Qt button style."""
+        hovered = bool(hovered)
+        if self.native_hovered == hovered:
+            return
+        self.native_hovered = hovered
+        self.setProperty("nativeHover", hovered)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
     def _apply_style(self) -> None:
         if self.kind == "close":
             self.setStyleSheet(
@@ -230,7 +260,7 @@ class CaptionButton(QPushButton):
             pressed = "rgba(255,255,255,42)" if self.dark_mode else "rgba(0,0,0,32)"
             self.setStyleSheet(
                 "QPushButton{border:0;background:transparent;}"
-                f"QPushButton:hover{{background:{hover};}}"
+                f"QPushButton:hover,QPushButton[nativeHover=\"true\"]{{background:{hover};}}"
                 f"QPushButton:pressed{{background:{pressed};}}"
             )
 
@@ -268,6 +298,10 @@ class CustomTitleBar(QWidget):
         self._host_window = window
         self.active = True
         self.dark_mode = True
+        self._drag_press_global: QPoint | None = None
+        self._drag_press_local: QPoint | None = None
+        self._drag_was_maximized = False
+        self._system_move_started = False
         self.setObjectName("customTitleBar")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setFixedHeight(self.HEIGHT)
@@ -342,22 +376,86 @@ class CustomTitleBar(QWidget):
         self.title.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
 
     def mousePressEvent(self, event: QMouseEvent):
-        # Windows native WM_NCHITTEST turns this area into HTCAPTION. The other
-        # platforms use Qt's system move operation so the compositor can retain
-        # native dragging, snapping, and tiling behavior where it supports it.
-        if not IS_WINDOWS and event.button() == Qt.MouseButton.LeftButton:
-            handle = self._host_window.windowHandle()
-            if handle and handle.startSystemMove():
-                event.accept()
-                return
+        # This is a client region on every platform. Keep a short press as a
+        # click (so double-click still maximizes), then ask the window manager
+        # to move only after the user actually drags.
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and not self._over_caption_button(event.position().toPoint())
+        ):
+            self._drag_press_global = event.globalPosition().toPoint()
+            self._drag_press_local = event.position().toPoint()
+            self._drag_was_maximized = self._host_window._is_chrome_maximized()
+            self._system_move_started = False
+            event.accept()
+            return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        if (
+            not self._system_move_started
+            and self._drag_press_global is not None
+            and self._drag_press_local is not None
+            and event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            global_pos = event.globalPosition().toPoint()
+            if (
+                global_pos - self._drag_press_global
+            ).manhattanLength() >= QApplication.startDragDistance():
+                if self._drag_was_maximized:
+                    normal_geometry = self._host_window.normalGeometry()
+                    if normal_geometry.isEmpty():
+                        normal_geometry = self._host_window.geometry()
+                    horizontal_fraction = self._drag_press_local.x() / max(1, self.width())
+                    self._host_window.showNormal()
+                    self._host_window.move(
+                        global_pos.x() - round(normal_geometry.width() * horizontal_fraction),
+                        global_pos.y() - min(self._drag_press_local.y(), self.HEIGHT - 1),
+                    )
+                    # Do not repeatedly restore/reposition if a platform does
+                    # not support startSystemMove() for this window.
+                    self._drag_was_maximized = False
+                handle = self._host_window.windowHandle()
+                self._system_move_started = bool(handle and handle.startSystemMove())
+                if self._system_move_started:
+                    event.accept()
+                    return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._reset_drag_state()
+        super().mouseReleaseEvent(event)
+
+    def contextMenuEvent(self, event) -> None:
+        if IS_WINDOWS:
+            # TrackPopupMenu expects physical screen pixels. Qt's global point
+            # may be device-independent on a mixed-DPI desktop, so ask Windows
+            # for the native cursor location instead.
+            global_pos = POINT()
+            if not user32.GetCursorPos(ctypes.byref(global_pos)):
+                fallback = event.globalPos()
+                global_pos.x, global_pos.y = fallback.x(), fallback.y()
+            self._host_window._show_system_menu(
+                self._host_window._hwnd(), int(global_pos.x), int(global_pos.y)
+            )
+            event.accept()
+            return
+        super().contextMenuEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton and not self._over_caption_button(event.position().toPoint()):
+            self._reset_drag_state()
             self._host_window.toggleMaximized()
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
+
+    def _reset_drag_state(self) -> None:
+        self._drag_press_global = None
+        self._drag_press_local = None
+        self._drag_was_maximized = False
+        self._system_move_started = False
 
     def _over_caption_button(self, pos: QPoint) -> bool:
         if IS_MACOS:
@@ -524,7 +622,7 @@ class FramelessMainWindow(QMainWindow):
         self._apply_windows_dwm_options()
 
     def toggleMaximized(self) -> None:
-        if self.isMaximized():
+        if self._is_chrome_maximized():
             self.showNormal()
         else:
             self.showMaximized()
@@ -534,6 +632,19 @@ class FramelessMainWindow(QMainWindow):
 
     def contentWidget(self) -> QWidget:
         return self.content
+
+    def _is_chrome_maximized(self, hwnd_value: int | None = None) -> bool:
+        """Return the actual maximize state used for caption behavior."""
+        if self.isMaximized():
+            return True
+        if IS_WINDOWS:
+            # Native-event callers provide MSG.hwnd so this check never tries
+            # to create a native handle while Windows is already dispatching a
+            # message for that handle.
+            hwnd = hwnd_value if hwnd_value is not None else int(self.winId())
+            if hwnd:
+                return bool(user32.IsZoomed(wintypes.HWND(hwnd)))
+        return False
 
     # ----------------------------- Qt events ------------------------------
     @staticmethod
@@ -601,7 +712,7 @@ class FramelessMainWindow(QMainWindow):
     def changeEvent(self, event):
         super().changeEvent(event)
         if hasattr(self, "title_bar"):
-            self.title_bar.max_button.kind = "restore" if self.isMaximized() else "max"
+            self.title_bar.max_button.kind = "restore" if self._is_chrome_maximized() else "max"
             self.title_bar.max_button.update()
             self.title_bar.setActive(self.isActiveWindow())
 
@@ -645,6 +756,14 @@ class FramelessMainWindow(QMainWindow):
             corner = ctypes.c_int(DWMWCP_ROUND)
             dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
                                          ctypes.byref(corner), ctypes.sizeof(corner))
+            # WS_THICKFRAME is necessary for native resize behavior, but on
+            # Windows 11 DWM can draw a visible one-pixel frame around this
+            # otherwise frameless window (especially noticeable while maximized).
+            # Hide that DWM border consistently; unsupported builds report an
+            # HRESULT and keep their normal appearance.
+            border_color = ctypes.c_uint(DWMWA_COLOR_NONE)
+            dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR,
+                                         ctypes.byref(border_color), ctypes.sizeof(border_color))
             dark = wintypes.BOOL(self._dark_mode)
             dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
                                          ctypes.byref(dark), ctypes.sizeof(dark))
@@ -695,10 +814,14 @@ class FramelessMainWindow(QMainWindow):
                 return HTMAXBUTTON  # Required for Windows 11 Snap Layout hover.
             if inside(self._native_rect(tb.min_button, dpr)):
                 return HTCLIENT
-            return HTCAPTION
+            # The remaining title bar is a Qt client region. CustomTitleBar
+            # starts QWindow.startSystemMove() from its mouse press event.
+            return HTCLIENT
 
-        def _resize_hit_test(self, x: int, y: int, dpr: float) -> int | None:
-            if self.isMaximized() or self.isFullScreen():
+        def _resize_hit_test(
+            self, x: int, y: int, dpr: float, hwnd_value: int | None = None
+        ) -> int | None:
+            if self._is_chrome_maximized(hwnd_value) or self.isFullScreen():
                 return None
             border = max(5, round(self.RESIZE_BORDER * dpr))
             w, h = round(self.width() * dpr), round(self.height() * dpr)
@@ -766,7 +889,24 @@ class FramelessMainWindow(QMainWindow):
             )
             self._clear_max_button_press(hwnd_value)
             if should_toggle:
-                self.toggleMaximized()
+                # A taskbar restore can still be completing while the first
+                # non-client button-up arrives. Queue the transition so Qt and
+                # the native HWND agree on the pre-click maximize state.
+                QTimer.singleShot(0, self.toggleMaximized)
+
+        def _set_max_button_native_hover(self, hovered: bool) -> None:
+            self.title_bar.max_button.setNativeHover(hovered)
+
+        @staticmethod
+        def _track_nonclient_mouse_leave(hwnd_value: int) -> None:
+            # WM_NCMOUSELEAVE is only guaranteed after explicitly registering
+            # a non-client leave tracker. This prevents the custom hover color
+            # from getting stuck when the pointer exits the window directly.
+            tracker = TRACKMOUSEEVENT()
+            tracker.cbSize = ctypes.sizeof(TRACKMOUSEEVENT)
+            tracker.dwFlags = TME_LEAVE | TME_NONCLIENT
+            tracker.hwndTrack = wintypes.HWND(hwnd_value)
+            user32.TrackMouseEvent(ctypes.byref(tracker))
 
         @staticmethod
         def _show_system_menu(hwnd_value: int, screen_x: int, screen_y: int) -> None:
@@ -797,6 +937,32 @@ class FramelessMainWindow(QMainWindow):
 
             if msg.message == WM_NCCALCSIZE:
                 return True, 0
+
+            if msg.message == WM_NCMOUSEMOVE:
+                # The maximize region is deliberately non-client so Windows 11
+                # can offer Snap Layouts. Qt therefore never receives a normal
+                # QPushButton hover event for it; mirror that state explicitly
+                # while leaving the native message unhandled for the shell.
+                if int(msg.wParam) == HTMAXBUTTON:
+                    self._track_nonclient_mouse_leave(int(msg.hwnd))
+                    self._set_max_button_native_hover(True)
+                else:
+                    self._set_max_button_native_hover(False)
+                return False, 0
+
+            if msg.message == WM_MOUSEMOVE and self.title_bar.max_button.native_hovered:
+                x = _signed_word(int(msg.lParam))
+                y = _signed_word(int(msg.lParam) >> 16)
+                self._set_max_button_native_hover(
+                    self._max_button_contains_native_point(
+                        x, y, self._window_dpr(int(msg.hwnd))
+                    )
+                )
+                return False, 0
+
+            if msg.message in (WM_NCMOUSELEAVE, WM_MOUSELEAVE):
+                self._set_max_button_native_hover(False)
+                return False, 0
 
             if (
                 msg.message in (WM_NCLBUTTONDOWN, WM_NCLBUTTONDBLCLK)
@@ -841,7 +1007,7 @@ class FramelessMainWindow(QMainWindow):
                 screen_y = _signed_word(int(msg.lParam) >> 16)
                 x, y = self._screen_to_client_native(int(msg.hwnd), screen_x, screen_y)
                 dpr = self._window_dpr(int(msg.hwnd))
-                resize = self._resize_hit_test(x, y, dpr)
+                resize = self._resize_hit_test(x, y, dpr, int(msg.hwnd))
                 if resize is not None:
                     return True, resize
                 caption = self._caption_hit_test(x, y, dpr)
