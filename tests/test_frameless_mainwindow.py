@@ -190,9 +190,15 @@ class FramelessMainWindowTests(unittest.TestCase):
 
     @unittest.skipUnless(IS_WINDOWS, "Windows-only taskbar restore behavior")
     def test_windows_maximize_click_restores_after_taskbar_restore(self) -> None:
-        # Qt 6.11 on Windows Server exposes WS_THICKFRAME in geometry() after
-        # a maximize cycle, so frameGeometry() is the stable, visible window
-        # bounds that this behavior must preserve.
+        # The hosted Windows runner has a small virtual desktop. Use a normal
+        # size that is guaranteed to fit so Windows does not clamp it during
+        # restore; frameGeometry() is the stable, visible window bounds.
+        work_area = self.window.screen().availableGeometry()
+        self.window.resize(
+            max(self.window.minimumWidth(), min(700, work_area.width() - 80)),
+            max(self.window.minimumHeight(), min(500, work_area.height() - 80)),
+        )
+        self.app.processEvents()
         normal_geometry = self.window.frameGeometry()
         hwnd = self.window._hwnd()
         self.window.showMaximized()
@@ -252,6 +258,12 @@ class FramelessMainWindowTests(unittest.TestCase):
 
     @unittest.skipUnless(IS_WINDOWS, "Windows-only drag from maximized title bar")
     def test_windows_dragging_maximized_title_bar_restores_and_enables_resize(self) -> None:
+        work_area = self.window.screen().availableGeometry()
+        self.window.resize(
+            max(self.window.minimumWidth(), min(700, work_area.width() - 80)),
+            max(self.window.minimumHeight(), min(500, work_area.height() - 80)),
+        )
+        self.app.processEvents()
         normal_geometry = self.window.frameGeometry()
         self.window.showMaximized()
         self.app.processEvents()
