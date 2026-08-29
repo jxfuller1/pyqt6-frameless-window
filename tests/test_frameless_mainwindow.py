@@ -87,9 +87,11 @@ class FramelessMainWindowTests(unittest.TestCase):
     @unittest.skipUnless(IS_WINDOWS, "Windows-only custom caption controls")
     def test_windows_caption_styles_do_not_draw_native_buttons(self) -> None:
         style = fw.user32.GetWindowLongPtrW(self.window._hwnd(), fw.GWL_STYLE)
-        native_caption_bits = fw.WS_CAPTION | fw.WS_SYSMENU | fw.WS_MINIMIZEBOX
+        native_caption_bits = fw.WS_CAPTION
         self.assertEqual(style & native_caption_bits, 0)
         self.assertTrue(style & fw.WS_THICKFRAME)
+        self.assertTrue(style & fw.WS_SYSMENU)
+        self.assertTrue(style & fw.WS_MINIMIZEBOX)
         self.assertTrue(style & fw.WS_MAXIMIZEBOX)
 
         dpr = self.window._window_dpr()
@@ -161,6 +163,30 @@ class FramelessMainWindowTests(unittest.TestCase):
         self.assertFalse(self.window.titleBar().max_button.isDown())
         self.assertEqual(int(fw.user32.GetCapture() or 0), 0)
         self.assertTrue(self.window.isMaximized())
+
+    @unittest.skipUnless(IS_WINDOWS, "Windows-only taskbar minimize behavior")
+    def test_windows_system_minimize_restore_commands_are_enabled(self) -> None:
+        hwnd = self.window._hwnd()
+        style = fw.user32.GetWindowLongPtrW(hwnd, fw.GWL_STYLE)
+        self.assertTrue(style & fw.WS_SYSMENU)
+        self.assertTrue(style & fw.WS_MINIMIZEBOX)
+
+        self.assertTrue(
+            fw.user32.PostMessageW(
+                fw.wintypes.HWND(hwnd), fw.WM_SYSCOMMAND, fw.SC_MINIMIZE, 0
+            )
+        )
+        self.app.processEvents()
+        self.assertTrue(self.window.isMinimized())
+
+        self.assertTrue(
+            fw.user32.PostMessageW(
+                fw.wintypes.HWND(hwnd), fw.WM_SYSCOMMAND, fw.SC_RESTORE, 0
+            )
+        )
+        self.app.processEvents()
+        self.assertFalse(self.window.isMinimized())
+        self.assertTrue(self.window.isVisible())
 
     @unittest.skipUnless(IS_WINDOWS, "Windows-only maximize hover")
     def test_windows_maximize_hover_is_mirrored_to_custom_button(self) -> None:

@@ -35,6 +35,9 @@ if IS_WINDOWS:
     WM_DPICHANGED = 0x02E0
     WM_SYSCOMMAND = 0x0112
 
+    SC_MINIMIZE = 0xF020
+    SC_RESTORE = 0xF120
+
     HTCLIENT = 1
     HTCAPTION = 2
     HTSYSMENU = 3
@@ -758,13 +761,12 @@ class FramelessMainWindow(QMainWindow):
         def _configure_native_window(self) -> None:
             hwnd = self._hwnd()
             style = user32.GetWindowLongPtrW(hwnd, GWL_STYLE)
-            # FramelessWindowHint does not always strip all caption-button bits
-            # after Qt creates the HWND. Keeping WS_SYSMENU / WS_MINIMIZEBOX
-            # makes Windows paint a second caption-button set over the custom
-            # controls. Retain only the resize frame and maximize capability
-            # required for edge resize and Windows 11 Snap Layouts.
-            style &= ~(WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX)
-            style |= WS_THICKFRAME | WS_MAXIMIZEBOX
+            # Remove only the native visual caption. The system-menu and
+            # minimize/maximize capability bits let Explorer treat this as a
+            # normal taskbar window (including click-to-minimize/restore), but
+            # without WS_CAPTION they do not paint a second caption button set.
+            style &= ~WS_CAPTION
+            style |= WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX
             user32.SetWindowLongPtrW(hwnd, GWL_STYLE, style)
             # Tell Windows to re-read the modified non-client style immediately.
             # Without SWP_FRAMECHANGED, stale caption buttons can remain visible
